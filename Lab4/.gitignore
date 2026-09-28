@@ -1,0 +1,22 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Результаты сборки
+x64/
+x86/
+Debug/
+Release/
+bin/
+obj/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.log
+*.tlog
+*.idb
