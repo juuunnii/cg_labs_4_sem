@@ -353,7 +353,7 @@ private:
     size_t mSunIndex = 0;
     size_t mFlashlightIndex = 0;
     float  mSceneHeight = 1.0f;
-    float  mSunIntensity = 0.6f;
+    float  mSunIntensity = 1.2f;
     float  mFlashlightIntensity = 3.0f;
     bool   mSunOn = true;
     bool   mFlashlightOn = true;
@@ -370,6 +370,16 @@ private:
     bool mFreezeFrustum = false;     // K — «заморозить» фрустум и посмотреть на результат со стороны
     bool mShowOctree = false;        // V — показать узлы октодерева, попавшие во фрустум
     BoundingFrustum mFrozenFrustum;
+
+    // ---------- Лаба 5: каскадные тени ----------
+    // ObjectCB: [0] — камера, [1..4] — каскады (ViewProj от солнца)
+    static const UINT kObjectCBCount = 1 + CascadedShadowMap::kCascadeCount;
+    bool  mShadowsOn = true;         // J — тени вкл/выкл
+    bool  mShowCascades = false;     // H — подкрасить каскады
+    UINT  mPcfKernel = 3;            // P — 1 / 3 / 5 / 7
+    float mCascadeLambda = 0.8f;     // , / . — насколько нелинейно разбиение (0 — равномерно, 1 — логарифм)
+    float mShadowDistance = 100.0f;  // до какой глубины от камеры строятся тени
+    BoundingBox mSceneBounds;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -472,20 +482,14 @@ bool SponzaApp::KeyPressed(int vk)
 
 void SponzaApp::UpdateCaption()
 {
-    const CullingStats& st = mObjects.Stats();
-
-    std::wstring mode = !mCullingOn ? L"OFF" : (mUseOctree ? L"octree" : L"brute force");
-
-    wchar_t stats[256];
-    swprintf_s(stats, L"Culling[C/O]: %s | visible %u / %u | tests %u | nodes %u | %.3f ms",
-        mode.c_str(), st.Visible, st.Total, st.BoxTests, st.NodesVisited, st.TimeMs);
-
-    std::wstring s = stats;
-    if (mFreezeFrustum) s += L" | FROZEN[K]";
-    s += L" | Octree view[V] | Tess[T]:";
-    s += mUseTessellation ? L"on" : L"off";
-    s += L" Wire[M]";
-    mMainWndCaption = s;
+    wchar_t buf[256];
+    swprintf_s(buf,
+        L"Shadows[J]:%s | PCF[P]:%ux%u | lambda[,/.]:%.2f | Cascades[H]:%s | splits %.0f / %.0f / %.0f / %.0f",
+        mShadowsOn ? L"on" : L"off", mPcfKernel, mPcfKernel, mCascadeLambda,
+        mShowCascades ? L"on" : L"off",
+        mRenderer.CascadeSplitFar(0), mRenderer.CascadeSplitFar(1),
+        mRenderer.CascadeSplitFar(2), mRenderer.CascadeSplitFar(3));
+    mMainWndCaption = buf;
 }
 
 void SponzaApp::Update(const GameTimer& gt)
@@ -515,6 +519,7 @@ void SponzaApp::Update(const GameTimer& gt)
     // Максимальный уровень тесселяции: '-' / '='
     if (KeyPressed(VK_OEM_MINUS)) { mTessMaxFactor = MathHelper::Max(1.0f, mTessMaxFactor / 2.0f);  captionDirty = true; }
     if (KeyPressed(VK_OEM_PLUS))  { mTessMaxFactor = MathHelper::Min(64.0f, mTessMaxFactor * 2.0f); captionDirty = true; }
+    (void)captionDirty;   // заголовок теперь обновляется каждый кадр
 
     // Сила displacement: '[' / ']'
     if (GetAsyncKeyState(VK_OEM_4) & 0x8000) mDisplacementScale *= (1.0f - dt);
@@ -525,6 +530,17 @@ void SponzaApp::Update(const GameTimer& gt)
     if (KeyPressed('O')) mUseOctree = !mUseOctree;
     if (KeyPressed('V')) mShowOctree = !mShowOctree;
     if (KeyPressed('K')) mFreezeFrustum = !mFreezeFrustum;
+
+    // Тени
+    if (KeyPressed('J')) mShadowsOn = !mShadowsOn;
+    if (KeyPressed('H')) mShowCascades = !mShowCascades;
+    if (KeyPressed('P')) mPcfKernel = (mPcfKernel >= 7) ? 1 : mPcfKernel + 2;
+    if (GetAsyncKeyState(VK_OEM_COMMA)  & 0x8000) mCascadeLambda = MathHelper::Max(0.0f, mCascadeLambda - 0.5f * dt);
+    if (GetAsyncKeyState(VK_OEM_PERIOD) & 0x8000) mCascadeLambda = MathHelper::Min(1.0f, mCascadeLambda + 0.5f * dt);
+
+    mRenderer.SetShadowsEnabled(mShadowsOn);
+    mRenderer.SetShowCascades(mShowCascades);
+    mRenderer.SetPcfKernel(mPcfKernel);
 
     if (mAnimEnabled)
         mAnimTime += dt;
@@ -545,6 +561,12 @@ void SponzaApp::Update(const GameTimer& gt)
     const CullingMode mode = !mCullingOn ? CullingMode::None
                            : (mUseOctree ? CullingMode::Octree : CullingMode::BruteForce);
     mObjects.Update(mFreezeFrustum ? mFrozenFrustum : frustumW, mode, mShowOctree && mCullingOn && mUseOctree);
+
+    // Каскады теней: делим фрустум камеры по глубине и строим матрицы солнца для каждого куска
+    mRenderer.UpdateShadows(mCamera.GetView4x4f(), mCamera.GetLook3f(),
+        mCamera.GetFovY(), mCamera.GetAspect(), mCamera.GetNearZ(),
+        mShadowDistance, mCascadeLambda,
+        mRenderer.Lights()[mSunIndex].Direction, mSceneBounds);
 
     UpdateCaption();
 
@@ -577,6 +599,16 @@ void SponzaApp::UpdateObjectCB()
     oc.UseTessellation   = mUseTessellation ? 1u : 0u;
 
     mObjectCB->CopyData(0, oc);
+
+    // Для каждого каскада — те же параметры (тесселяция считается от камеры,
+    // поэтому рельеф в тени совпадает с рельефом на экране), но ViewProj — от солнца
+    for (UINT c = 0; c < CascadedShadowMap::kCascadeCount; ++c)
+    {
+        ObjectConstants sc = oc;
+        XMMATRIX lightVP = XMLoadFloat4x4(&mRenderer.CascadeViewProj(c));
+        XMStoreFloat4x4(&sc.ViewProj, XMMatrixTranspose(lightVP));
+        mObjectCB->CopyData((int)(1 + c), sc);
+    }
 }
 
 void SponzaApp::UpdateMaterialCB()
@@ -642,6 +674,15 @@ void SponzaApp::Draw(const GameTimer& gt)
     scene.InstancedGeometry = mObjects.Geometry();
     scene.InstanceBuffer = mObjects.InstanceBuffer();
     scene.Batches = &mObjects.Batches();
+    scene.ShadowBatches = &mObjects.ShadowBatches();
+
+    // Тени: b0 для каждого каскада
+    const UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+    for (UINT c = 0; c < CascadedShadowMap::kCascadeCount; ++c)
+        scene.ShadowObjectCB[c] = scene.ObjectCB + (UINT64)(1 + c) * objCBByteSize;
+
+    scene.ScreenViewport = mScreenViewport;
+    scene.ScissorRect = mScissorRect;
 
     mRenderer.Render(mCommandList.Get(), scene, CurrentBackBufferView(), DepthStencilView());
 
@@ -853,7 +894,7 @@ void SponzaApp::BuildMaterialSrvs()
 
 void SponzaApp::BuildConstantBuffers()
 {
-    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
+    mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), kObjectCBCount, true);
     mMaterialCB = std::make_unique<UploadBuffer<SurfaceConstants>>(md3dDevice.Get(),
         (UINT)mSponza->GetMaterials().size(), true);
 }
@@ -976,4 +1017,9 @@ void SponzaApp::BuildLights()
     mRenderer.SetAmbient({ 0.06f, 0.06f, 0.07f, 1.0f });
     mRenderer.SetSkyColor({ 0.69f, 0.77f, 0.87f, 1.0f });
     mRenderer.SetPositionScale(8.0f / longSize);
+
+    // Тени отбрасывает солнце; каскады покрывают глубину до 80% размера сцены
+    mRenderer.SetShadowLightIndex((int)mSunIndex);
+    mShadowDistance = 0.8f * longSize;
+    BoundingBox::CreateFromPoints(mSceneBounds, XMLoadFloat3(&bmin), XMLoadFloat3(&bmax));
 }

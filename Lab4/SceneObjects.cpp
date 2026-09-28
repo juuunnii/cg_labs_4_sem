@@ -119,8 +119,37 @@ void SceneObjects::Build(ID3D12Device* device, ID3D12GraphicsCommandList* cmdLis
 
     mOctree.Build(mBounds, 6, 16);
 
-    mCapacity = objectCount + kMaxDebugBoxes;
+    // Буфер экземпляров:
+    //   [0, N)       — все объекты (пишутся один раз, для shadow pass)
+    //   [N, 2N)      — объекты, прошедшие culling (каждый кадр)
+    //   [2N, ...)    — отладочные рамки узлов октодерева
+    mCapacity = 2 * objectCount + kMaxDebugBoxes;
     mInstanceBuffer = std::make_unique<UploadBuffer<InstanceData>>(device, mCapacity, false);
+
+    UINT offset = 0;
+    mShadowBatches.clear();
+    for (UINT m = 0; m < MeshCount; ++m)
+    {
+        const UINT start = offset;
+        for (const Object& o : mObjects)
+        {
+            if (o.Mesh != m) continue;
+            InstanceData d;
+            XMStoreFloat4x4(&d.World, XMMatrixTranspose(XMLoadFloat4x4(&o.World)));
+            d.Color = o.Color;
+            mInstanceBuffer->CopyData((int)offset++, d);
+        }
+        if (offset > start)
+        {
+            InstancedBatch b;
+            b.IndexCount = mMeshes[m].IndexCount;
+            b.StartIndex = mMeshes[m].StartIndexLocation;
+            b.BaseVertex = mMeshes[m].BaseVertexLocation;
+            b.InstanceOffset = start;
+            b.InstanceCount = offset - start;
+            mShadowBatches.push_back(b);
+        }
+    }
 
     mStats.Total = objectCount;
 
@@ -180,7 +209,7 @@ void SceneObjects::Update(const BoundingFrustum& frustumW, CullingMode mode, boo
     // Буфер экземпляров: видимые объекты, сгруппированные по мешу
     //--------------------------------------------------------------
     mBatches.clear();
-    UINT offset = 0;
+    UINT offset = (UINT)mObjects.size();   // первая половина буфера занята статичными данными для теней
 
     for (UINT m = 0; m < MeshCount; ++m)
     {

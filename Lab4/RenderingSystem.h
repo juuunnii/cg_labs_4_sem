@@ -2,6 +2,7 @@
 #include "Common/d3dUtil.h"
 #include "Common/UploadBuffer.h"
 #include "GBuffer.h"
+#include "CascadedShadowMap.h"
 #include "Model.h"
 #include <vector>
 #include <memory>
@@ -17,68 +18,87 @@ enum LightType : int
 // Один источник света. Раскладка = 4 x float4 (64 байта), совпадает с HLSL.
 struct LightData
 {
-    DirectX::XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };   // point / spot
-    float Range = 10.0f;                                 // point / spot: где свет гаснет до нуля
-    DirectX::XMFLOAT3 Direction = { 0.0f, -1.0f, 0.0f }; // directional / spot (нормализованное)
-    float SpotInnerCos = 0.95f;                          // spot: внутри — полная яркость
+    DirectX::XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
+    float Range = 10.0f;
+    DirectX::XMFLOAT3 Direction = { 0.0f, -1.0f, 0.0f };
+    float SpotInnerCos = 0.95f;
     DirectX::XMFLOAT3 Color = { 1.0f, 1.0f, 1.0f };
     float Intensity = 1.0f;
     int   Type = LightPoint;
-    float SpotOuterCos = 0.90f;                          // spot: снаружи — темно
+    float SpotOuterCos = 0.90f;
     DirectX::XMFLOAT2 Pad = { 0.0f, 0.0f };
 };
 
 static const int kMaxDeferredLights = 32;
 
-// Константы lighting pass (b0 в DeferredLighting.hlsl)
+// Константы lighting pass (b0 в DeferredLighting.hlsl) — порядок полей важен!
 struct LightingPassConstants
 {
     DirectX::XMFLOAT3 EyePosW = { 0.0f, 0.0f, 0.0f };
     UINT NumLights = 0;
     DirectX::XMFLOAT4 Ambient = { 0.05f, 0.05f, 0.06f, 1.0f };
     DirectX::XMFLOAT4 SkyColor = { 0.69f, 0.77f, 0.87f, 1.0f };
-    UINT DebugView = 0;           // 0 = итог, 1 = albedo, 2 = нормали, 3 = позиции
-    float PositionScale = 0.01f;  // для отладочного вида позиций
+    UINT DebugView = 0;
+    float PositionScale = 0.01f;
     DirectX::XMFLOAT2 Pad = { 0.0f, 0.0f };
+
+    // ---- Каскадные тени ----
+    DirectX::XMFLOAT4X4 ShadowViewProj[CascadedShadowMap::kCascadeCount];
+    DirectX::XMFLOAT4 CascadeSplits = { 0, 0, 0, 0 };       // дальняя граница каждого каскада
+    DirectX::XMFLOAT4 CascadeTexelWorld = { 0, 0, 0, 0 };   // размер тексела в мире
+    DirectX::XMFLOAT3 CameraForward = { 0.0f, 0.0f, 1.0f };
+    UINT ShadowsEnabled = 1;
+    UINT PcfKernel = 3;          // 1, 3, 5 или 7
+    UINT ShowCascades = 0;       // подкрасить каскады цветом
+    int  ShadowLightIndex = 0;   // какой источник отбрасывает тени
+    float ShadowMapSize = 2048.0f;
+
     LightData Lights[kMaxDeferredLights];
 };
 
-// Один вызов инстансинга: меш + диапазон в буфере экземпляров
+// Один вызов инстансинга
 struct InstancedBatch
 {
     UINT IndexCount = 0;
     UINT StartIndex = 0;
     INT  BaseVertex = 0;
-    UINT InstanceOffset = 0;   // с какого элемента StructuredBuffer читать
+    UINT InstanceOffset = 0;
     UINT InstanceCount = 0;
-    bool Wireframe = false;    // отладочные рамки узлов октодерева
+    bool Wireframe = false;
 };
 
-// Всё, что нужно для отрисовки сцены в geometry pass
+// Всё, что нужно для отрисовки кадра
 struct SceneDrawData
 {
+    // Sponza
     const MeshGeometry* Geometry = nullptr;
     const std::vector<ModelSubset>* Subsets = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS ObjectCB = 0;       // b0
-    D3D12_GPU_VIRTUAL_ADDRESS MaterialCB = 0;     // начало буфера материалов (b1)
+    D3D12_GPU_VIRTUAL_ADDRESS ObjectCB = 0;       // b0 для камеры
+    D3D12_GPU_VIRTUAL_ADDRESS MaterialCB = 0;
     UINT MaterialCBByteSize = 0;
-    UINT SrvPerMaterial = 4;                      // diffuse, mask, normal, height
+    UINT SrvPerMaterial = 4;
 
-    // Множество объектов, рисуемых инстансингом (лаба 4)
+    // Объекты (инстансинг)
     const MeshGeometry* InstancedGeometry = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS InstanceBuffer = 0;             // StructuredBuffer<InstanceData>
-    const std::vector<InstancedBatch>* Batches = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS InstanceBuffer = 0;
+    const std::vector<InstancedBatch>* Batches = nullptr;         // видимые камерой
+    const std::vector<InstancedBatch>* ShadowBatches = nullptr;   // все (отбрасывают тени)
+
+    // Тени: b0 для каждого каскада (тот же формат, что ObjectCB, но ViewProj — от солнца)
+    D3D12_GPU_VIRTUAL_ADDRESS ShadowObjectCB[CascadedShadowMap::kCascadeCount] = {};
+
+    // Экранный viewport — восстанавливается после shadow pass
+    D3D12_VIEWPORT ScreenViewport = {};
+    D3D12_RECT ScissorRect = {};
 };
 
-// Deferred rendering с тесселяцией:
-//   1) Geometry pass: VS -> HS -> тесселятор -> DS (displacement) -> PS (normal map) -> G-буфер
-//   2) Lighting pass: полноэкранный треугольник, для каждого пикселя
-//      читается G-буфер и суммируется вклад всех источников света
+// Deferred rendering:
+//   0) Shadow pass: глубина сцены из точки зрения солнца в каждый каскад
+//   1) Geometry pass: VS -> HS -> DS (displacement) -> PS (normal map) -> G-буфер
+//   2) Lighting pass: полноэкранный треугольник, свет + каскадные тени с PCF
 class RenderingSystem
 {
 public:
-    // numSceneSrvs — сколько дескрипторов нужно под текстуры сцены.
-    // Они лежат в начале общей кучи, за ними — 3 SRV G-буфера.
     void Initialize(ID3D12Device* device, UINT width, UINT height,
                     DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
                     UINT numSceneSrvs);
@@ -99,24 +119,43 @@ public:
     void SetWireframe(bool w)                    { mWireframe = w; }
     bool Wireframe() const                       { return mWireframe; }
 
-    // Раз в кадр: переносит источники и позицию камеры в константный буфер
+    // ---- Тени ----
+    void SetShadowsEnabled(bool e)               { mPass.ShadowsEnabled = e ? 1u : 0u; }
+    bool ShadowsEnabled() const                  { return mPass.ShadowsEnabled != 0; }
+    void SetPcfKernel(UINT k)                    { mPass.PcfKernel = k; }
+    UINT PcfKernel() const                       { return mPass.PcfKernel; }
+    void SetShowCascades(bool s)                 { mPass.ShowCascades = s ? 1u : 0u; }
+    bool ShowCascades() const                    { return mPass.ShowCascades != 0; }
+    void SetShadowLightIndex(int i)              { mPass.ShadowLightIndex = i; }
+
+    // Пересчёт каскадов под камеру; после вызова доступны CascadeViewProj()
+    void UpdateShadows(const DirectX::XMFLOAT4X4& cameraView, const DirectX::XMFLOAT3& cameraForward,
+                       float fovY, float aspect, float nearZ, float shadowDistance, float lambda,
+                       const DirectX::XMFLOAT3& lightDir, const DirectX::BoundingBox& sceneBounds);
+    const DirectX::XMFLOAT4X4& CascadeViewProj(UINT i) const { return mShadowMap.ViewProj(i); }
+    float CascadeSplitFar(UINT i) const { return mShadowMap.SplitFar(i); }
+
     void UpdatePassConstants(const DirectX::XMFLOAT3& eyePosW);
 
-    // Back buffer к этому моменту должен быть в состоянии RENDER_TARGET
     void Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
                 D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv);
 
 private:
     void BuildRootSignatures();
     void BuildShadersAndPSOs();
+    void RenderShadowPass(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene);
 
 private:
+    static const UINT kShadowMapSize = 2048;
+
     ID3D12Device* mDevice = nullptr;
     DXGI_FORMAT mBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     DXGI_FORMAT mDepthFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
     GBuffer mGBuffer;
+    CascadedShadowMap mShadowMap;
 
+    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap]
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mSrvHeap;
     UINT mSrvDescriptorSize = 0;
     UINT mNumSceneSrvs = 0;
@@ -124,13 +163,16 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> mGeometryRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> mInstancedRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> mLightingRootSig;
+
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mGeometryPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mGeometryWirePSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mInstancedPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mInstancedWirePSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> mShadowPSO;            // Sponza в карту теней
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> mShadowInstancedPSO;   // объекты в карту теней
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mLightingPSO;
 
-    Microsoft::WRL::ComPtr<ID3DBlob> mGeometryVS, mGeometryHS, mGeometryDS, mGeometryPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> mGeometryVS, mGeometryHS, mGeometryDS, mGeometryPS, mShadowPS;
     Microsoft::WRL::ComPtr<ID3DBlob> mInstancedVS, mInstancedPS;
     Microsoft::WRL::ComPtr<ID3DBlob> mLightingVS, mLightingPS;
 

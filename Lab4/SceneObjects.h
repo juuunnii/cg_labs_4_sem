@@ -43,6 +43,7 @@ public:
     const MeshGeometry* Geometry() const { return mGeo.get(); }
     D3D12_GPU_VIRTUAL_ADDRESS InstanceBuffer() const { return mInstanceBuffer->Resource()->GetGPUVirtualAddress(); }
     const std::vector<InstancedBatch>& Batches() const { return mBatches; }
+    const std::vector<InstancedBatch>& ShadowBatches() const { return mShadowBatches; }   // все объекты — для теней
     const CullingStats& Stats() const { return mStats; }
     const Octree& Tree() const { return mOctree; }
 
@@ -76,5 +77,6 @@ private:
     std::vector<UINT> mVisible;
     std::vector<DirectX::BoundingBox> mVisibleNodes;
     std::vector<InstancedBatch> mBatches;
+    std::vector<InstancedBatch> mShadowBatches;
     CullingStats mStats;
 };

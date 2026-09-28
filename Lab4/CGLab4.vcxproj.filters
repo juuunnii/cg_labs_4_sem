@@ -14,6 +14,7 @@
     <ClCompile Include="RenderingSystem.cpp" />
     <ClCompile Include="Octree.cpp" />
     <ClCompile Include="SceneObjects.cpp" />
+    <ClCompile Include="CascadedShadowMap.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\Camera.h" />
@@ -31,6 +32,7 @@
     <ClInclude Include="RenderingSystem.h" />
     <ClInclude Include="Octree.h" />
     <ClInclude Include="SceneObjects.h" />
+    <ClInclude Include="CascadedShadowMap.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\sponza.hlsl" />
