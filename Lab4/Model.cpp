@@ -6,7 +6,7 @@
 
 using namespace DirectX;
 
-// В .mtl Sponza пути записаны через '\' — приводим к '/' и убираем хвостовые пробелы
+// Р’ .mtl Sponza РїСѓС‚Рё Р·Р°РїРёСЃР°РЅС‹ С‡РµСЂРµР· '\' вЂ” РїСЂРёРІРѕРґРёРј Рє '/' Рё СѓР±РёСЂР°РµРј С…РІРѕСЃС‚РѕРІС‹Рµ РїСЂРѕР±РµР»С‹
 static std::string NormalizePath(std::string p)
 {
     std::replace(p.begin(), p.end(), '\\', '/');
@@ -36,7 +36,7 @@ bool Model::LoadFromOBJ(const std::string& filename)
     mSubsets.clear();
     mMaterials.clear();
 
-    // ---------- Материалы ----------
+    // ---------- РњР°С‚РµСЂРёР°Р»С‹ ----------
     mMaterials.resize(materials.size());
     for (size_t i = 0; i < materials.size(); ++i)
     {
@@ -47,7 +47,7 @@ bool Model::LoadFromOBJ(const std::string& filename)
         if (!src.diffuse_texname.empty())
         {
             dst.DiffuseTexture = basedir + NormalizePath(src.diffuse_texname);
-            // Цвет задаёт текстура, Kd не домножаем (иначе всё темнеет)
+            // Р¦РІРµС‚ Р·Р°РґР°С‘С‚ С‚РµРєСЃС‚СѓСЂР°, Kd РЅРµ РґРѕРјРЅРѕР¶Р°РµРј (РёРЅР°С‡Рµ РІСЃС‘ С‚РµРјРЅРµРµС‚)
             dst.DiffuseAlbedo = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
         }
         else
@@ -59,9 +59,9 @@ bool Model::LoadFromOBJ(const std::string& filename)
             dst.AlphaTexture = basedir + NormalizePath(src.alpha_texname);
     }
 
-    // ---------- Геометрия, сгруппированная по материалам ----------
-    // Важно: один shape из tinyobj может содержать грани с разными материалами,
-    // поэтому группируем по material_id каждой грани, а не по shape.
+    // ---------- Р“РµРѕРјРµС‚СЂРёСЏ, СЃРіСЂСѓРїРїРёСЂРѕРІР°РЅРЅР°СЏ РїРѕ РјР°С‚РµСЂРёР°Р»Р°Рј ----------
+    // Р’Р°Р¶РЅРѕ: РѕРґРёРЅ shape РёР· tinyobj РјРѕР¶РµС‚ СЃРѕРґРµСЂР¶Р°С‚СЊ РіСЂР°РЅРё СЃ СЂР°Р·РЅС‹РјРё РјР°С‚РµСЂРёР°Р»Р°РјРё,
+    // РїРѕСЌС‚РѕРјСѓ РіСЂСѓРїРїРёСЂСѓРµРј РїРѕ material_id РєР°Р¶РґРѕР№ РіСЂР°РЅРё, Р° РЅРµ РїРѕ shape.
     const UINT defaultMat = static_cast<UINT>(materials.size());
     std::vector<std::vector<std::uint32_t>> perMaterial(materials.size() + 1);
     std::map<std::tuple<int, int, int>, std::uint32_t> uniqueVertices;
@@ -72,7 +72,7 @@ bool Model::LoadFromOBJ(const std::string& filename)
         for (size_t f = 0; f < shape.mesh.num_face_vertices.size(); ++f)
         {
             const unsigned fv = shape.mesh.num_face_vertices[f];
-            if (fv != 3) { indexOffset += fv; continue; } // после триангуляции должны быть только треугольники
+            if (fv != 3) { indexOffset += fv; continue; } // РїРѕСЃР»Рµ С‚СЂРёР°РЅРіСѓР»СЏС†РёРё РґРѕР»Р¶РЅС‹ Р±С‹С‚СЊ С‚РѕР»СЊРєРѕ С‚СЂРµСѓРіРѕР»СЊРЅРёРєРё
 
             int mid = shape.mesh.material_ids[f];
             UINT matIndex = (mid < 0 || mid >= (int)materials.size()) ? defaultMat : (UINT)mid;
@@ -101,7 +101,7 @@ bool Model::LoadFromOBJ(const std::string& filename)
                     if (idx.texcoord_index >= 0)
                     {
                         vertex.TexCoord.x = attrib.texcoords[2 * idx.texcoord_index + 0];
-                        vertex.TexCoord.y = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1]; // OBJ: V вверх, D3D: V вниз
+                        vertex.TexCoord.y = 1.0f - attrib.texcoords[2 * idx.texcoord_index + 1]; // OBJ: V РІРІРµСЂС…, D3D: V РІРЅРёР·
                     }
 
                     vertIndex = static_cast<std::uint32_t>(mVertices.size());
@@ -119,7 +119,7 @@ bool Model::LoadFromOBJ(const std::string& filename)
         }
     }
 
-    // Склеиваем индексы в один буфер: по одному сабсету на материал
+    // РЎРєР»РµРёРІР°РµРј РёРЅРґРµРєСЃС‹ РІ РѕРґРёРЅ Р±СѓС„РµСЂ: РїРѕ РѕРґРЅРѕРјСѓ СЃР°Р±СЃРµС‚Сѓ РЅР° РјР°С‚РµСЂРёР°Р»
     for (UINT m = 0; m < (UINT)perMaterial.size(); ++m)
     {
         if (perMaterial[m].empty()) continue;
@@ -133,7 +133,22 @@ bool Model::LoadFromOBJ(const std::string& filename)
         mIndices.insert(mIndices.end(), perMaterial[m].begin(), perMaterial[m].end());
     }
 
-    // Грани без материала получают материал по умолчанию (последний)
+    // Р“Р°Р±Р°СЂРёС‚С‹ РјРѕРґРµР»Рё
+    if (!mVertices.empty())
+    {
+        mBoundsMin = mBoundsMax = mVertices[0].Position;
+        for (const auto& v : mVertices)
+        {
+            if (v.Position.x < mBoundsMin.x) mBoundsMin.x = v.Position.x;
+            if (v.Position.y < mBoundsMin.y) mBoundsMin.y = v.Position.y;
+            if (v.Position.z < mBoundsMin.z) mBoundsMin.z = v.Position.z;
+            if (v.Position.x > mBoundsMax.x) mBoundsMax.x = v.Position.x;
+            if (v.Position.y > mBoundsMax.y) mBoundsMax.y = v.Position.y;
+            if (v.Position.z > mBoundsMax.z) mBoundsMax.z = v.Position.z;
+        }
+    }
+
+    // Р“СЂР°РЅРё Р±РµР· РјР°С‚РµСЂРёР°Р»Р° РїРѕР»СѓС‡Р°СЋС‚ РјР°С‚РµСЂРёР°Р» РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ (РїРѕСЃР»РµРґРЅРёР№)
     if (!perMaterial[defaultMat].empty())
     {
         ModelMaterial def;

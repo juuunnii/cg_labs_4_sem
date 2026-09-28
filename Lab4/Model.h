@@ -8,20 +8,20 @@
 struct ModelVertex
 {
     DirectX::XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
-    DirectX::XMFLOAT3 Normal = { 0.0f, 1.0f, 0.0f };
+    DirectX::XMFLOAT3 Normal   = { 0.0f, 1.0f, 0.0f };
     DirectX::XMFLOAT2 TexCoord = { 0.0f, 0.0f };
 };
 
-// Материал из .mtl
+// РњР°С‚РµСЂРёР°Р» РёР· .mtl
 struct ModelMaterial
 {
     std::string Name;
     DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
-    std::string DiffuseTexture;   // map_Kd (путь уже с папкой модели, пусто = нет текстуры)
-    std::string AlphaTexture;     // map_d  (маска прозрачности: листья, цепи)
+    std::string DiffuseTexture;   // map_Kd (РїСѓС‚СЊ СѓР¶Рµ СЃ РїР°РїРєРѕР№ РјРѕРґРµР»Рё, РїСѓСЃС‚Рѕ = РЅРµС‚ С‚РµРєСЃС‚СѓСЂС‹)
+    std::string AlphaTexture;     // map_d  (РјР°СЃРєР° РїСЂРѕР·СЂР°С‡РЅРѕСЃС‚Рё: Р»РёСЃС‚СЊСЏ, С†РµРїРё)
 };
 
-// Кусок индексного буфера, который рисуется одним материалом
+// РљСѓСЃРѕРє РёРЅРґРµРєСЃРЅРѕРіРѕ Р±СѓС„РµСЂР°, РєРѕС‚РѕСЂС‹Р№ СЂРёСЃСѓРµС‚СЃСЏ РѕРґРЅРёРј РјР°С‚РµСЂРёР°Р»РѕРј
 struct ModelSubset
 {
     UINT MaterialIndex = 0;
@@ -36,10 +36,17 @@ public:
     void CreateBuffers(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList);
 
     std::unique_ptr<MeshGeometry> GetMeshGeometry() { return std::move(mMeshGeo); }
-    const std::vector<ModelSubset>& GetSubsets()   const { return mSubsets; }
+    const std::vector<ModelSubset>&   GetSubsets()   const { return mSubsets; }
     const std::vector<ModelMaterial>& GetMaterials() const { return mMaterials; }
 
+    // Р“Р°Р±Р°СЂРёС‚С‹ РјРѕРґРµР»Рё (РЅСѓР¶РЅС‹, С‡С‚РѕР±С‹ СЂР°СЃСЃС‚Р°РІРёС‚СЊ РёСЃС‚РѕС‡РЅРёРєРё СЃРІРµС‚Р° РїРѕРґ Р»СЋР±РѕР№ РјР°СЃС€С‚Р°Р±)
+    DirectX::XMFLOAT3 GetBoundsMin() const { return mBoundsMin; }
+    DirectX::XMFLOAT3 GetBoundsMax() const { return mBoundsMax; }
+
 private:
+    DirectX::XMFLOAT3 mBoundsMin = { 0.0f, 0.0f, 0.0f };
+    DirectX::XMFLOAT3 mBoundsMax = { 0.0f, 0.0f, 0.0f };
+
     std::vector<ModelVertex>   mVertices;
     std::vector<std::uint32_t> mIndices;
     std::vector<ModelSubset>   mSubsets;

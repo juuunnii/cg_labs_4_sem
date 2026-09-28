@@ -10,6 +10,8 @@
     <ClCompile Include="Common\MathHelper.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
+    <ClCompile Include="GBuffer.cpp" />
+    <ClCompile Include="RenderingSystem.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\Camera.h" />
@@ -23,6 +25,8 @@
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="Model.h" />
     <ClInclude Include="tiny_obj_loader.h" />
+    <ClInclude Include="GBuffer.h" />
+    <ClInclude Include="RenderingSystem.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\sponza.hlsl" />

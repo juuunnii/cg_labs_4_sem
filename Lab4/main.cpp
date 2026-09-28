@@ -1,8 +1,9 @@
-﻿#include "Common/d3dApp.h"
+#include "Common/d3dApp.h"
 #include "Common/MathHelper.h"
 #include "Common/UploadBuffer.h"
 #include "Common/Camera.h"
 #include "Model.h"
+#include "RenderingSystem.h"
 
 #include <wincodec.h>
 #include <unordered_map>
@@ -23,7 +24,7 @@ static IWICImagingFactory* GetWICFactory()
     static ComPtr<IWICImagingFactory> factory;
     if (!factory)
     {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // WIC — это COM
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
             CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
             return nullptr;
@@ -37,7 +38,6 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
     IWICImagingFactory* wic = GetWICFactory();
     if (!wic) return E_FAIL;
 
-    // 1. Декодируем картинку и переводим в RGBA 8 бит
     ComPtr<IWICBitmapDecoder> decoder;
     HRESULT hr = wic->CreateDecoderFromFilename(fileName, nullptr, GENERIC_READ,
         WICDecodeMetadataCacheOnDemand, &decoder);
@@ -64,7 +64,6 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
     hr = converter->CopyPixels(nullptr, width * 4, (UINT)mips[0].size(), mips[0].data());
     if (FAILED(hr)) return hr;
 
-    // 2. Mip-уровни: каждый следующий — усреднение 2x2 пикселей предыдущего
     std::vector<UINT> mipW{ width }, mipH{ height };
     while (mipW.back() > 1 || mipH.back() > 1)
     {
@@ -83,7 +82,7 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
                 for (UINT c = 0; c < 4; ++c)
                 {
                     UINT sum = src[(size_t(y0) * sw + x0) * 4 + c] + src[(size_t(y0) * sw + x1) * 4 + c]
-                        + src[(size_t(y1) * sw + x0) * 4 + c] + src[(size_t(y1) * sw + x1) * 4 + c];
+                             + src[(size_t(y1) * sw + x0) * 4 + c] + src[(size_t(y1) * sw + x1) * 4 + c];
                     dst[(size_t(y) * dw + x) * 4 + c] = (uint8_t)((sum + 2) / 4);
                 }
             }
@@ -95,7 +94,6 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
     }
     const UINT mipCount = (UINT)mips.size();
 
-    // 3. Текстура в видеопамяти
     CD3DX12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(
         DXGI_FORMAT_R8G8B8A8_UNORM, width, height, 1, (UINT16)mipCount);
     CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
@@ -103,7 +101,6 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
         D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&texture));
     if (FAILED(hr)) return hr;
 
-    // 4. Промежуточный upload-буфер
     const UINT64 uploadSize = GetRequiredIntermediateSize(texture.Get(), 0, mipCount);
     CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
     CD3DX12_RESOURCE_DESC bufDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadSize);
@@ -111,7 +108,6 @@ static HRESULT LoadTextureWIC(ID3D12Device* device, ID3D12GraphicsCommandList* c
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&uploadHeap));
     if (FAILED(hr)) return hr;
 
-    // 5. Копирование всех mip-уровней
     std::vector<D3D12_SUBRESOURCE_DATA> subresources(mipCount);
     for (UINT i = 0; i < mipCount; ++i)
     {
@@ -137,14 +133,12 @@ struct ObjectConstants
     DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
 };
 
-// Тайлинг и анимация одного материала
 struct MaterialAnim
 {
-    XMFLOAT2 Tiling = { 1.0f, 1.0f };       // во сколько раз повторить текстуру
-    XMFLOAT2 ScrollSpeed = { 0.0f, 0.0f };  // сдвиг UV в секунду
+    XMFLOAT2 Tiling = { 1.0f, 1.0f };
+    XMFLOAT2 ScrollSpeed = { 0.0f, 0.0f };
 };
 
-// Индексы текстур материала в mTextures (0 = белая заглушка)
 struct MaterialTextures
 {
     int Diffuse = 0;
@@ -173,17 +167,18 @@ private:
     void CreateWhiteTexture();
     int  LoadTexture(const std::string& path);
     void BuildTextures();
-    void BuildDescriptorHeaps();
+    void BuildMaterialSrvs();
     void BuildConstantBuffers();
     void BuildMaterialAnimations();
-    void BuildRootSignature();
-    void BuildShadersAndInputLayout();
-    void BuildPSO();
-    void UpdateMaterialCB(const GameTimer& gt);
+    void BuildLights();
+
+    void UpdateMaterialCB();
+    void UpdateLights();
+    bool KeyPressed(int vk);   // true один раз на нажатие
 
 private:
-    ComPtr<ID3D12RootSignature> mRootSignature = nullptr;
-    ComPtr<ID3D12DescriptorHeap> mSrvHeap = nullptr;
+    RenderingSystem mRenderer;
+    bool mRendererReady = false;
 
     std::unique_ptr<UploadBuffer<ObjectConstants>> mObjectCB = nullptr;
     std::unique_ptr<UploadBuffer<MaterialConstants>> mMaterialCB = nullptr;
@@ -191,15 +186,10 @@ private:
     std::unique_ptr<Model> mSponza = nullptr;
     std::unique_ptr<MeshGeometry> mSponzaGeo = nullptr;
 
-    std::vector<std::unique_ptr<Texture>> mTextures;       // [0] = белая текстура
-    std::unordered_map<std::string, int> mTextureLookup;   // путь -> индекс в mTextures
-    std::vector<MaterialTextures> mMatTextures;            // по материалам
-    std::vector<MaterialAnim> mMatAnims;                   // по материалам
-
-    ComPtr<ID3DBlob> mvsByteCode = nullptr;
-    ComPtr<ID3DBlob> mpsByteCode = nullptr;
-    std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
-    ComPtr<ID3D12PipelineState> mPSO = nullptr;
+    std::vector<std::unique_ptr<Texture>> mTextures;
+    std::unordered_map<std::string, int> mTextureLookup;
+    std::vector<MaterialTextures> mMatTextures;
+    std::vector<MaterialAnim> mMatAnims;
 
     XMFLOAT4X4 mWorld = MathHelper::Identity4x4();
     Camera mCamera;
@@ -207,11 +197,23 @@ private:
     float mMoveSpeed = 30.0f;
     POINT mLastMousePos = {};
 
-    // Управление с клавиатуры
+    // Тайлинг/анимация
     float mGlobalTiling = 1.0f;
     bool  mAnimEnabled = true;
-    bool  mToggleKeyWasDown = false;
     float mAnimTime = 0.0f;
+
+    // Свет
+    std::vector<XMFLOAT3> mPointLightBase;   // исходные позиции точечных источников (для анимации)
+    size_t mFirstPointLight = 0;
+    size_t mSunIndex = 0;
+    size_t mFlashlightIndex = 0;
+    float  mSceneHeight = 1.0f;
+    float  mSunIntensity = 0.6f;
+    float  mFlashlightIntensity = 3.0f;
+    bool   mSunOn = true;
+    bool   mFlashlightOn = true;
+
+    std::unordered_map<int, bool> mKeyWasDown;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -236,7 +238,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, in
 
 SponzaApp::SponzaApp(HINSTANCE hInstance) : D3DApp(hInstance)
 {
-    mMainWndCaption = L"Sponza. WASD - move, LMB - look, 1/2 - tiling, 0 - reset, 3 - anim on/off";
+    mMainWndCaption = L"Sponza deferred | WASD, LMB | F flashlight | L sun | G G-buffer view | 1/2/0 tiling | 3 anim";
     mClientWidth = 1280;
     mClientHeight = 720;
 
@@ -263,20 +265,24 @@ bool SponzaApp::Initialize()
     if (!BuildModel())
         return false;
 
-    BuildTextures();              // команды копирования пишутся в открытый command list
-    BuildDescriptorHeaps();       // после текстур — теперь известно, сколько SRV
+    BuildTextures();
+
+    // Система рендера: G-буфер, шейдеры, PSO. Под текстуры сцены — 2 SRV на материал.
+    const UINT matCount = (UINT)mSponza->GetMaterials().size();
+    mRenderer.Initialize(md3dDevice.Get(), mClientWidth, mClientHeight,
+        mBackBufferFormat, mDepthStencilFormat, matCount * 2);
+    mRendererReady = true;
+
+    BuildMaterialSrvs();
     BuildConstantBuffers();
     BuildMaterialAnimations();
-    BuildRootSignature();
-    BuildShadersAndInputLayout();
-    BuildPSO();
+    BuildLights();
 
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
     FlushCommandQueue();
 
-    // Копирование на GPU завершено — промежуточные буферы больше не нужны
     for (auto& tex : mTextures)
         tex->UploadHeap = nullptr;
     if (mSponzaGeo)
@@ -288,7 +294,19 @@ bool SponzaApp::Initialize()
 void SponzaApp::OnResize()
 {
     D3DApp::OnResize();
-    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+    mCamera.SetLens(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 5000.0f);
+
+    // G-буфер должен совпадать по размеру с окном
+    if (mRendererReady)
+        mRenderer.OnResize(mClientWidth, mClientHeight);
+}
+
+bool SponzaApp::KeyPressed(int vk)
+{
+    const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    const bool pressed = down && !mKeyWasDown[vk];
+    mKeyWasDown[vk] = down;
+    return pressed;
 }
 
 void SponzaApp::Update(const GameTimer& gt)
@@ -301,16 +319,17 @@ void SponzaApp::Update(const GameTimer& gt)
     if (GetAsyncKeyState('A') & 0x8000) mCamera.Strafe(-speed);
     if (GetAsyncKeyState('D') & 0x8000) mCamera.Strafe(speed);
 
-    // Тайлинг: 1 — реже, 2 — чаще, 0 — сброс
     if (GetAsyncKeyState('1') & 0x8000) mGlobalTiling = MathHelper::Max(0.25f, mGlobalTiling - dt);
     if (GetAsyncKeyState('2') & 0x8000) mGlobalTiling = MathHelper::Min(16.0f, mGlobalTiling + dt);
     if (GetAsyncKeyState('0') & 0x8000) mGlobalTiling = 1.0f;
 
-    // 3 — вкл/выкл анимацию (срабатывает один раз на нажатие)
-    const bool toggleDown = (GetAsyncKeyState('3') & 0x8000) != 0;
-    if (toggleDown && !mToggleKeyWasDown)
-        mAnimEnabled = !mAnimEnabled;
-    mToggleKeyWasDown = toggleDown;
+    if (KeyPressed('3')) mAnimEnabled = !mAnimEnabled;
+    if (KeyPressed('F')) mFlashlightOn = !mFlashlightOn;
+    if (KeyPressed('L')) mSunOn = !mSunOn;
+    if (KeyPressed('G')) mRenderer.SetDebugView(mRenderer.DebugView() + 1);
+
+    if (mAnimEnabled)
+        mAnimTime += dt;
 
     mCamera.UpdateViewMatrix();
 
@@ -322,23 +341,19 @@ void SponzaApp::Update(const GameTimer& gt)
     XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(world));
     mObjectCB->CopyData(0, objConstants);
 
-    UpdateMaterialCB(gt);
+    UpdateMaterialCB();
+    UpdateLights();
+    mRenderer.UpdatePassConstants(mCamera.GetPosition3f());
 }
 
-void SponzaApp::UpdateMaterialCB(const GameTimer& gt)
+void SponzaApp::UpdateMaterialCB()
 {
-    if (mAnimEnabled)
-        mAnimTime += gt.DeltaTime();
-
     const auto& materials = mSponza->GetMaterials();
     for (size_t i = 0; i < materials.size(); ++i)
     {
         const MaterialAnim& a = mMatAnims[i];
 
-        // Тайлинг — масштаб UV (сэмплер WRAP повторяет текстуру)
         XMMATRIX S = XMMatrixScaling(a.Tiling.x * mGlobalTiling, a.Tiling.y * mGlobalTiling, 1.0f);
-
-        // Анимация — сдвиг UV во времени
         const float u = fmodf(a.ScrollSpeed.x * mAnimTime, 1.0f);
         const float v = fmodf(a.ScrollSpeed.y * mAnimTime, 1.0f);
         XMMATRIX T = XMMatrixTranslation(u, v, 0.0f);
@@ -346,15 +361,36 @@ void SponzaApp::UpdateMaterialCB(const GameTimer& gt)
         MaterialConstants mc;
         mc.DiffuseAlbedo = materials[i].DiffuseAlbedo;
         XMStoreFloat4x4(&mc.MatTransform, XMMatrixTranspose(S * T));
-
         mMaterialCB->CopyData((int)i, mc);
     }
+}
+
+void SponzaApp::UpdateLights()
+{
+    auto& lights = mRenderer.Lights();
+
+    // Солнце вкл/выкл
+    lights[mSunIndex].Intensity = mSunOn ? mSunIntensity : 0.0f;
+
+    // Точечные источники плавно «покачиваются» по высоте
+    for (size_t i = 0; i < mPointLightBase.size(); ++i)
+    {
+        XMFLOAT3 p = mPointLightBase[i];
+        p.y += sinf(mAnimTime * 1.5f + (float)i) * 0.03f * mSceneHeight;
+        lights[mFirstPointLight + i].Position = p;
+    }
+
+    // Фонарик — прожектор, привязанный к камере
+    LightData& flash = lights[mFlashlightIndex];
+    flash.Position = mCamera.GetPosition3f();
+    flash.Direction = mCamera.GetLook3f();
+    flash.Intensity = mFlashlightOn ? mFlashlightIntensity : 0.0f;
 }
 
 void SponzaApp::Draw(const GameTimer& gt)
 {
     ThrowIfFailed(mDirectCmdListAlloc->Reset());
-    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mPSO.Get()));
+    ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
 
     mCommandList->RSSetViewports(1, &mScreenViewport);
     mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -363,59 +399,28 @@ void SponzaApp::Draw(const GameTimer& gt)
         D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     mCommandList->ResourceBarrier(1, &toRT);
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtv = CurrentBackBufferView();
-    D3D12_CPU_DESCRIPTOR_HANDLE dsv = DepthStencilView();
+    SceneDrawData scene;
+    scene.Geometry = mSponzaGeo.get();
+    scene.Subsets = &mSponza->GetSubsets();
+    scene.ObjectCB = mObjectCB->Resource()->GetGPUVirtualAddress();
+    scene.MaterialCB = mMaterialCB->Resource()->GetGPUVirtualAddress();
+    scene.MaterialCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
+    scene.SrvPerMaterial = 2;
 
-    mCommandList->ClearRenderTargetView(rtv, Colors::LightSteelBlue, 0, nullptr);
-    mCommandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
-    mCommandList->OMSetRenderTargets(1, &rtv, true, &dsv);
-
-    ID3D12DescriptorHeap* descriptorHeaps[] = { mSrvHeap.Get() };
-    mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
-    mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
-
-    // b0 — константы объекта
-    mCommandList->SetGraphicsRootConstantBufferView(1, mObjectCB->Resource()->GetGPUVirtualAddress());
-
-    if (mSponzaGeo)
-    {
-        D3D12_VERTEX_BUFFER_VIEW vbv = mSponzaGeo->VertexBufferView();
-        D3D12_INDEX_BUFFER_VIEW ibv = mSponzaGeo->IndexBufferView();
-        mCommandList->IASetVertexBuffers(0, 1, &vbv);
-        mCommandList->IASetIndexBuffer(&ibv);
-        mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        const UINT matCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
-        const D3D12_GPU_VIRTUAL_ADDRESS matCBBase = mMaterialCB->Resource()->GetGPUVirtualAddress();
-
-        for (const auto& subset : mSponza->GetSubsets())
-        {
-            // t0, t1 — пара дескрипторов материала (diffuse, mask)
-            CD3DX12_GPU_DESCRIPTOR_HANDLE tex(mSrvHeap->GetGPUDescriptorHandleForHeapStart(),
-                (INT)subset.MaterialIndex * 2, mCbvSrvUavDescriptorSize);
-            mCommandList->SetGraphicsRootDescriptorTable(0, tex);
-
-            // b1 — константы материала
-            mCommandList->SetGraphicsRootConstantBufferView(2,
-                matCBBase + (UINT64)subset.MaterialIndex * matCBByteSize);
-
-            mCommandList->DrawIndexedInstanced(subset.IndexCount, 1, subset.IndexStart, 0, 0);
-        }
-    }
+    // Geometry pass + lighting pass
+    mRenderer.Render(mCommandList.Get(), scene, CurrentBackBufferView(), DepthStencilView());
 
     CD3DX12_RESOURCE_BARRIER toPresent = CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
         D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     mCommandList->ResourceBarrier(1, &toPresent);
 
     ThrowIfFailed(mCommandList->Close());
-
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
 
     ThrowIfFailed(mSwapChain->Present(0, 0));
     mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
 
-    // Ждём GPU каждый кадр — поэтому константы безопасно перезаписывать в Update
     FlushCommandQueue();
 }
 
@@ -437,24 +442,21 @@ void SponzaApp::OnMouseMove(WPARAM btnState, int x, int y)
     {
         float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
         float dy = XMConvertToRadians(0.25f * static_cast<float>(y - mLastMousePos.y));
-
         mCamera.Pitch(dy);
         mCamera.RotateY(dx);
     }
-
     mLastMousePos.x = x;
     mLastMousePos.y = y;
 }
 
 //======================================================================================
-// Модель
+// Модель и текстуры
 //======================================================================================
 bool SponzaApp::BuildModel()
 {
     mSponza = std::make_unique<Model>();
 
-    const std::string modelPath = "Models/sponza.obj";
-    if (!mSponza->LoadFromOBJ(modelPath))
+    if (!mSponza->LoadFromOBJ("Models/sponza.obj"))
     {
         MessageBox(0, L"Failed to load Sponza model!\nCheck if model exists in Models/sponza.obj", L"Error", MB_OK);
         return false;
@@ -462,16 +464,9 @@ bool SponzaApp::BuildModel()
 
     mSponza->CreateBuffers(md3dDevice.Get(), mCommandList.Get());
     mSponzaGeo = mSponza->GetMeshGeometry();
-
-    OutputDebugString(L"Model loaded successfully!\n");
     return true;
 }
 
-//======================================================================================
-// Текстуры
-//======================================================================================
-
-// Белая текстура 1x1 — для материалов без текстуры/маски или если файл не найден
 void SponzaApp::CreateWhiteTexture()
 {
     auto tex = std::make_unique<Texture>();
@@ -502,8 +497,6 @@ void SponzaApp::CreateWhiteTexture()
     mTextures.push_back(std::move(tex));
 }
 
-// Загружает текстуру (.dds — через DDSTextureLoader, остальное — через WIC).
-// Возвращает индекс в mTextures, 0 — если загрузить не удалось.
 int SponzaApp::LoadTexture(const std::string& path)
 {
     if (path.empty())
@@ -536,8 +529,6 @@ int SponzaApp::LoadTexture(const std::string& path)
         return 0;
     }
 
-    OutputDebugStringA(("[Texture] loaded: " + path + "\n").c_str());
-
     const int index = (int)mTextures.size();
     mTextures.push_back(std::move(tex));
     mTextureLookup[path] = index;
@@ -546,58 +537,37 @@ int SponzaApp::LoadTexture(const std::string& path)
 
 void SponzaApp::BuildTextures()
 {
-    CreateWhiteTexture();   // индекс 0
+    CreateWhiteTexture();
 
     const auto& materials = mSponza->GetMaterials();
     mMatTextures.resize(materials.size());
-
     for (size_t i = 0; i < materials.size(); ++i)
     {
         mMatTextures[i].Diffuse = LoadTexture(materials[i].DiffuseTexture);
-        mMatTextures[i].Alpha = LoadTexture(materials[i].AlphaTexture);
-
-        OutputDebugStringA(("[Material] " + materials[i].Name +
-            "  diffuse: " + materials[i].DiffuseTexture +
-            "  alpha: " + materials[i].AlphaTexture + "\n").c_str());
+        mMatTextures[i].Alpha   = LoadTexture(materials[i].AlphaTexture);
     }
 }
 
-// На каждый материал — 2 соседних SRV: [diffuse, mask] -> t0, t1
-void SponzaApp::BuildDescriptorHeaps()
+// SRV текстур кладутся в начало кучи RenderingSystem: [diffuse, mask] на каждый материал
+void SponzaApp::BuildMaterialSrvs()
 {
-    const UINT matCount = (UINT)mSponza->GetMaterials().size();
-
-    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-    srvHeapDesc.NumDescriptors = matCount * 2;
-    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvHeap)));
-
     auto createSrv = [&](ID3D12Resource* res, D3D12_CPU_DESCRIPTOR_HANDLE handle)
-        {
-            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Format = res->GetDesc().Format;
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MostDetailedMip = 0;
-            srvDesc.Texture2D.MipLevels = res->GetDesc().MipLevels;
-            srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
-            md3dDevice->CreateShaderResourceView(res, &srvDesc, handle);
-        };
-
-    CD3DX12_CPU_DESCRIPTOR_HANDLE h(mSrvHeap->GetCPUDescriptorHandleForHeapStart());
-    for (UINT i = 0; i < matCount; ++i)
     {
-        createSrv(mTextures[mMatTextures[i].Diffuse]->Resource.Get(), h);
-        h.Offset(1, mCbvSrvUavDescriptorSize);
-        createSrv(mTextures[mMatTextures[i].Alpha]->Resource.Get(), h);
-        h.Offset(1, mCbvSrvUavDescriptorSize);
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = res->GetDesc().Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = res->GetDesc().MipLevels;
+        md3dDevice->CreateShaderResourceView(res, &srvDesc, handle);
+    };
+
+    for (UINT i = 0; i < (UINT)mMatTextures.size(); ++i)
+    {
+        createSrv(mTextures[mMatTextures[i].Diffuse]->Resource.Get(), mRenderer.SceneSrvCpuHandle(i * 2 + 0));
+        createSrv(mTextures[mMatTextures[i].Alpha]->Resource.Get(),   mRenderer.SceneSrvCpuHandle(i * 2 + 1));
     }
 }
 
-//======================================================================================
-// Константные буферы и анимация материалов
-//======================================================================================
 void SponzaApp::BuildConstantBuffers()
 {
     mObjectCB = std::make_unique<UploadBuffer<ObjectConstants>>(md3dDevice.Get(), 1, true);
@@ -605,7 +575,6 @@ void SponzaApp::BuildConstantBuffers()
         (UINT)mSponza->GetMaterials().size(), true);
 }
 
-// Какие материалы тайлятся и анимируются (имена материалов — в окне «Вывод», строки [Material])
 void SponzaApp::BuildMaterialAnimations()
 {
     const auto& materials = mSponza->GetMaterials();
@@ -617,87 +586,112 @@ void SponzaApp::BuildMaterialAnimations()
         std::transform(name.begin(), name.end(), name.begin(),
             [](unsigned char c) { return (char)std::tolower(c); });
 
-        auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
-
-        if (has("floor"))
-            mMatAnims[i].Tiling = { 3.0f, 3.0f };          // пол — мельче плитка
-        else if (has("fabric"))
-            mMatAnims[i].ScrollSpeed = { 0.05f, 0.0f };    // ткани — «бегущий» узор
+        if (name.find("floor") != std::string::npos)
+            mMatAnims[i].Tiling = { 3.0f, 3.0f };
+        else if (name.find("fabric") != std::string::npos)
+            mMatAnims[i].ScrollSpeed = { 0.05f, 0.0f };
     }
 }
 
 //======================================================================================
-// Root signature / шейдеры / PSO
+// Источники света. Позиции задаются в долях габаритов модели,
+// поэтому расстановка работает при любом масштабе Sponza.
 //======================================================================================
-void SponzaApp::BuildRootSignature()
+void SponzaApp::BuildLights()
 {
-    CD3DX12_DESCRIPTOR_RANGE texTable;
-    texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);   // t0, t1
+    const XMFLOAT3 bmin = mSponza->GetBoundsMin();
+    const XMFLOAT3 bmax = mSponza->GetBoundsMax();
+    const XMFLOAT3 size = { bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z };
+    const bool longAlongX = size.x >= size.z;
+    const float longSize = longAlongX ? size.x : size.z;
+    mSceneHeight = size.y;
 
-    CD3DX12_ROOT_PARAMETER slotRootParameter[3];
-    slotRootParameter[0].InitAsDescriptorTable(1, &texTable, D3D12_SHADER_VISIBILITY_PIXEL);
-    slotRootParameter[1].InitAsConstantBufferView(0);       // b0 cbPerObject
-    slotRootParameter[2].InitAsConstantBufferView(1);       // b1 cbMaterial
-
-    CD3DX12_STATIC_SAMPLER_DESC anisotropicWrap(
-        0,                                  // s0
-        D3D12_FILTER_ANISOTROPIC,
-        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-        0.0f, 8);
-
-    CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(3, slotRootParameter, 1, &anisotropicWrap,
-        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
-
-    ComPtr<ID3DBlob> serializedRootSig = nullptr;
-    ComPtr<ID3DBlob> errorBlob = nullptr;
-    HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-        serializedRootSig.GetAddressOf(), errorBlob.GetAddressOf());
-
-    if (errorBlob != nullptr)
-        ::OutputDebugStringA((char*)errorBlob->GetBufferPointer());
-    ThrowIfFailed(hr);
-
-    ThrowIfFailed(md3dDevice->CreateRootSignature(0,
-        serializedRootSig->GetBufferPointer(),
-        serializedRootSig->GetBufferSize(),
-        IID_PPV_ARGS(&mRootSignature)));
-}
-
-void SponzaApp::BuildShadersAndInputLayout()
-{
-    const std::wstring shaderPath = L"Shaders/sponza.hlsl";
-
-    mvsByteCode = d3dUtil::CompileShader(shaderPath, nullptr, "VS", "vs_5_0");
-    mpsByteCode = d3dUtil::CompileShader(shaderPath, nullptr, "PS", "ps_5_0");
-
-    mInputLayout =
+    // a — доля вдоль длинной стороны, h — доля высоты, b — доля поперёк
+    auto P = [&](float a, float h, float b) -> XMFLOAT3
     {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        if (longAlongX)
+            return { bmin.x + a * size.x, bmin.y + h * size.y, bmin.z + b * size.z };
+        return { bmin.x + b * size.x, bmin.y + h * size.y, bmin.z + a * size.z };
     };
-}
 
-void SponzaApp::BuildPSO()
-{
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    psoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
-    psoDesc.pRootSignature = mRootSignature.Get();
-    psoDesc.VS = { reinterpret_cast<BYTE*>(mvsByteCode->GetBufferPointer()), mvsByteCode->GetBufferSize() };
-    psoDesc.PS = { reinterpret_cast<BYTE*>(mpsByteCode->GetBufferPointer()), mpsByteCode->GetBufferSize() };
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;   // листья и ткани — одинарные плоскости
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.SampleMask = UINT_MAX;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = mBackBufferFormat;
-    psoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
-    psoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
-    psoDesc.DSVFormat = mDepthStencilFormat;
+    auto normalized = [](XMFLOAT3 v) -> XMFLOAT3
+    {
+        XMFLOAT3 r;
+        XMStoreFloat3(&r, XMVector3Normalize(XMLoadFloat3(&v)));
+        return r;
+    };
 
-    ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&mPSO)));
+    auto& lights = mRenderer.Lights();
+    lights.clear();
+    mPointLightBase.clear();
+
+    // ---------- 1. Directional: «солнце» сверху-сбоку ----------
+    {
+        LightData sun;
+        sun.Type = LightDirectional;
+        sun.Direction = normalized({ 0.3f, -1.0f, 0.25f });
+        sun.Color = { 1.0f, 0.92f, 0.78f };
+        sun.Intensity = mSunIntensity;
+        mSunIndex = lights.size();
+        lights.push_back(sun);
+    }
+
+    // ---------- 2. Point: 8 цветных источников вдоль галерей ----------
+    {
+        const XMFLOAT3 colors[8] =
+        {
+            { 1.0f, 0.25f, 0.15f }, { 0.2f, 1.0f, 0.3f }, { 0.3f, 0.45f, 1.0f }, { 1.0f, 0.75f, 0.2f },
+            { 1.0f, 0.3f, 0.9f },   { 0.2f, 1.0f, 1.0f }, { 1.0f, 0.55f, 0.2f }, { 0.65f, 0.3f, 1.0f }
+        };
+
+        mFirstPointLight = lights.size();
+        for (int i = 0; i < 8; ++i)
+        {
+            LightData pl;
+            pl.Type = LightPoint;
+            const float a = 0.12f + 0.76f * (float)(i / 2) / 3.0f;   // 4 позиции вдоль
+            const float b = (i % 2 == 0) ? 0.3f : 0.7f;              // две линии поперёк
+            pl.Position = P(a, 0.08f, b);
+            pl.Range = 0.2f * longSize;
+            pl.Color = colors[i];
+            pl.Intensity = 1.6f;
+            lights.push_back(pl);
+            mPointLightBase.push_back(pl.Position);
+        }
+    }
+
+    // ---------- 3. Spot: 3 прожектора сверху, светят вниз на пол ----------
+    for (int i = 0; i < 3; ++i)
+    {
+        LightData sl;
+        sl.Type = LightSpot;
+        sl.Position = P(0.25f + 0.25f * i, 0.6f, 0.5f);
+        sl.Direction = { 0.0f, -1.0f, 0.0f };
+        sl.Range = 0.9f * size.y;
+        sl.SpotInnerCos = cosf(XMConvertToRadians(14.0f));
+        sl.SpotOuterCos = cosf(XMConvertToRadians(24.0f));
+        sl.Color = { 1.0f, 0.95f, 0.85f };
+        sl.Intensity = 2.5f;
+        lights.push_back(sl);
+    }
+
+    // ---------- 4. Spot: фонарик камеры (позиция/направление — в UpdateLights) ----------
+    {
+        LightData fl;
+        fl.Type = LightSpot;
+        fl.Range = 0.5f * longSize;
+        fl.SpotInnerCos = cosf(XMConvertToRadians(10.0f));
+        fl.SpotOuterCos = cosf(XMConvertToRadians(18.0f));
+        fl.Color = { 1.0f, 1.0f, 0.95f };
+        fl.Intensity = mFlashlightIntensity;
+        mFlashlightIndex = lights.size();
+        lights.push_back(fl);
+    }
+
+    mRenderer.SetAmbient({ 0.06f, 0.06f, 0.07f, 1.0f });
+    mRenderer.SetSkyColor({ 0.69f, 0.77f, 0.87f, 1.0f });
+    mRenderer.SetPositionScale(8.0f / longSize);
+
+    // Скорость камеры под масштаб сцены (пересечь Sponza примерно за 10 секунд)
+    mMoveSpeed = longSize / 10.0f;
 }
