@@ -29,7 +29,9 @@
     <ClCompile Include="GBuffer.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Model.cpp" />
+    <ClCompile Include="Octree.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
+    <ClCompile Include="SceneObjects.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\Camera.h" />
@@ -43,7 +45,9 @@
     <ClInclude Include="Common\UploadBuffer.h" />
     <ClInclude Include="GBuffer.h" />
     <ClInclude Include="Model.h" />
+    <ClInclude Include="Octree.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="SceneObjects.h" />
     <ClInclude Include="tiny_obj_loader.h" />
   </ItemGroup>
   <ItemGroup>

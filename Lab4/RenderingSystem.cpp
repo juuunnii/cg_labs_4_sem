@@ -4,7 +4,7 @@ using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device,
-    const CD3DX12_ROOT_SIGNATURE_DESC& desc)
+                                                       const CD3DX12_ROOT_SIGNATURE_DESC& desc)
 {
     ComPtr<ID3DBlob> serialized;
     ComPtr<ID3DBlob> errors;
@@ -21,8 +21,8 @@ static ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device,
 }
 
 void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
-    DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
-    UINT numSceneSrvs)
+                                 DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
+                                 UINT numSceneSrvs)
 {
     mDevice = device;
     mBackBufferFormat = backBufferFormat;
@@ -87,15 +87,27 @@ void RenderingSystem::BuildRootSignatures()
             CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_ANISOTROPIC,
                 D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
                 D3D12_TEXTURE_ADDRESS_MODE_WRAP, 0.0f, 8),
-                // s1 — для SampleLevel в domain shader
-                CD3DX12_STATIC_SAMPLER_DESC(1, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-                    D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-                    D3D12_TEXTURE_ADDRESS_MODE_WRAP)
+            // s1 — для SampleLevel в domain shader
+            CD3DX12_STATIC_SAMPLER_DESC(1, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP)
         };
 
         CD3DX12_ROOT_SIGNATURE_DESC desc(3, params, 2, samplers,
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
         mGeometryRootSig = CreateRootSignature(mDevice, desc);
+    }
+
+    // ---------- Инстансинг: b0 кадр (ViewProj), t0 буфер экземпляров, b1 смещение в нём ----------
+    {
+        CD3DX12_ROOT_PARAMETER params[3];
+        params[0].InitAsConstantBufferView(0);
+        params[1].InitAsShaderResourceView(0);
+        params[2].InitAsConstants(1, 1);
+
+        CD3DX12_ROOT_SIGNATURE_DESC desc(3, params, 0, nullptr,
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+        mInstancedRootSig = CreateRootSignature(mDevice, desc);
     }
 
     // ---------- Lighting pass: t0..t2 G-буфер, b0 источники света ----------
@@ -157,6 +169,32 @@ void RenderingSystem::BuildShadersAndPSOs()
     wire.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
     ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&wire, IID_PPV_ARGS(&mGeometryWirePSO)));
 
+    // ---------- Инстансинг: простые меши (позиция + нормаль), без тесселяции ----------
+    mInstancedVS = d3dUtil::CompileShader(L"Shaders/Instanced.hlsl", nullptr, "VS", "vs_5_0");
+    mInstancedPS = d3dUtil::CompileShader(L"Shaders/Instanced.hlsl", nullptr, "PS", "ps_5_0");
+
+    static const D3D12_INPUT_ELEMENT_DESC instLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC inst = geo;
+    inst.InputLayout = { instLayout, _countof(instLayout) };
+    inst.pRootSignature = mInstancedRootSig.Get();
+    inst.VS = { mInstancedVS->GetBufferPointer(), mInstancedVS->GetBufferSize() };
+    inst.HS = { nullptr, 0 };
+    inst.DS = { nullptr, 0 };
+    inst.PS = { mInstancedPS->GetBufferPointer(), mInstancedPS->GetBufferSize() };
+    inst.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    inst.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&inst, IID_PPV_ARGS(&mInstancedPSO)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC instWire = inst;
+    instWire.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    instWire.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&instWire, IID_PPV_ARGS(&mInstancedWirePSO)));
+
     // ---------- Lighting pass PSO: полноэкранный треугольник, без вершинного буфера и глубины ----------
     D3D12_GRAPHICS_PIPELINE_STATE_DESC light = {};
     light.InputLayout = { nullptr, 0 };
@@ -180,7 +218,7 @@ void RenderingSystem::BuildShadersAndPSOs()
 }
 
 void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
-    D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv)
+                             D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv)
 {
     ID3D12DescriptorHeap* heaps[] = { mSrvHeap.Get() };
     cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
@@ -213,6 +251,30 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
                 scene.MaterialCB + (UINT64)subset.MaterialIndex * scene.MaterialCBByteSize);
 
             cmdList->DrawIndexedInstanced(subset.IndexCount, 1, subset.IndexStart, 0, 0);
+        }
+    }
+
+    // Объекты сцены — инстансингом, только те, что прошли frustum culling
+    if (scene.InstancedGeometry && scene.Batches && !scene.Batches->empty())
+    {
+        cmdList->SetGraphicsRootSignature(mInstancedRootSig.Get());
+        cmdList->SetGraphicsRootConstantBufferView(0, scene.ObjectCB);
+        cmdList->SetGraphicsRootShaderResourceView(1, scene.InstanceBuffer);
+
+        D3D12_VERTEX_BUFFER_VIEW vbv = scene.InstancedGeometry->VertexBufferView();
+        D3D12_INDEX_BUFFER_VIEW ibv = scene.InstancedGeometry->IndexBufferView();
+        cmdList->IASetVertexBuffers(0, 1, &vbv);
+        cmdList->IASetIndexBuffer(&ibv);
+        cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        for (const InstancedBatch& b : *scene.Batches)
+        {
+            if (b.InstanceCount == 0)
+                continue;
+            const bool wire = b.Wireframe || mWireframe;
+            cmdList->SetPipelineState(wire ? mInstancedWirePSO.Get() : mInstancedPSO.Get());
+            cmdList->SetGraphicsRoot32BitConstant(2, b.InstanceOffset, 0);
+            cmdList->DrawIndexedInstanced(b.IndexCount, b.InstanceCount, b.StartIndex, b.BaseVertex, 0);
         }
     }
 

@@ -4,6 +4,7 @@
 #include "Common/Camera.h"
 #include "Model.h"
 #include "RenderingSystem.h"
+#include "SceneObjects.h"
 
 #include <wincodec.h>
 #include <unordered_map>
@@ -101,7 +102,7 @@ static HRESULT UploadImage(ID3D12Device* device, ID3D12GraphicsCommandList* cmdL
                 for (UINT k = 0; k < c; ++k)
                 {
                     UINT sum = src[(size_t(y0) * sw + x0) * c + k] + src[(size_t(y0) * sw + x1) * c + k]
-                        + src[(size_t(y1) * sw + x0) * c + k] + src[(size_t(y1) * sw + x1) * c + k];
+                             + src[(size_t(y1) * sw + x0) * c + k] + src[(size_t(y1) * sw + x1) * c + k];
                     dst[(size_t(y) * dw + x) * c + k] = (uint8_t)((sum + 2) / 4);
                 }
             }
@@ -175,11 +176,11 @@ static ImageData HeightToNormalMap(const ImageData& height, float strength)
 {
     const int w = (int)height.Width, h = (int)height.Height;
     auto H = [&](int x, int y) -> float
-        {
-            x = (x % w + w) % w;   // текстуры повторяются — берём соседей «по кругу»
-            y = (y % h + h) % h;
-            return height.Pixels[size_t(y) * w + x] / 255.0f;
-        };
+    {
+        x = (x % w + w) % w;   // текстуры повторяются — берём соседей «по кругу»
+        y = (y % h + h) % h;
+        return height.Pixels[size_t(y) * w + x] / 255.0f;
+    };
 
     ImageData out;
     out.Width = height.Width;
@@ -192,9 +193,9 @@ static ImageData HeightToNormalMap(const ImageData& height, float strength)
         for (int x = 0; x < w; ++x)
         {
             const float gx = ((H(x + 1, y - 1) + 2.0f * H(x + 1, y) + H(x + 1, y + 1))
-                - (H(x - 1, y - 1) + 2.0f * H(x - 1, y) + H(x - 1, y + 1))) / 8.0f;
+                            - (H(x - 1, y - 1) + 2.0f * H(x - 1, y) + H(x - 1, y + 1))) / 8.0f;
             const float gy = ((H(x - 1, y + 1) + 2.0f * H(x, y + 1) + H(x + 1, y + 1))
-                - (H(x - 1, y - 1) + 2.0f * H(x, y - 1) + H(x + 1, y - 1))) / 8.0f;
+                            - (H(x - 1, y - 1) + 2.0f * H(x, y - 1) + H(x + 1, y - 1))) / 8.0f;
 
             float nx = -gx * strength, ny = -gy * strength, nz = 1.0f;
             const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
@@ -359,6 +360,16 @@ private:
 
     std::unordered_map<int, bool> mKeyWasDown;
     float mCaptionTimer = 0.0f;
+
+    // ---------- Лаба 4: множество объектов и frustum culling ----------
+    static const UINT kObjectCount = 8000;   // если ноутбук не тянет — уменьшите (например, до 1000)
+
+    SceneObjects mObjects;
+    bool mCullingOn = true;          // C — frustum culling вкл/выкл
+    bool mUseOctree = true;          // O — через октодерево / перебором
+    bool mFreezeFrustum = false;     // K — «заморозить» фрустум и посмотреть на результат со стороны
+    bool mShowOctree = false;        // V — показать узлы октодерева, попавшие во фрустум
+    BoundingFrustum mFrozenFrustum;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -423,6 +434,10 @@ bool SponzaApp::Initialize()
     BuildMaterialAnimations();
     BuildLights();
 
+    // Тысячи объектов по всему объёму Sponza + октодерево по их AABB
+    mObjects.Build(md3dDevice.Get(), mCommandList.Get(),
+        mSponza->GetBoundsMin(), mSponza->GetBoundsMax(), kObjectCount);
+
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
@@ -432,6 +447,7 @@ bool SponzaApp::Initialize()
         tex->UploadHeap = nullptr;
     if (mSponzaGeo)
         mSponzaGeo->DisposeUploaders();
+    mObjects.DisposeUploaders();
 
     UpdateCaption();
     return true;
@@ -456,15 +472,19 @@ bool SponzaApp::KeyPressed(int vk)
 
 void SponzaApp::UpdateCaption()
 {
-    std::wstring s = L"Sponza | Tess[T]:";
+    const CullingStats& st = mObjects.Stats();
+
+    std::wstring mode = !mCullingOn ? L"OFF" : (mUseOctree ? L"octree" : L"brute force");
+
+    wchar_t stats[256];
+    swprintf_s(stats, L"Culling[C/O]: %s | visible %u / %u | tests %u | nodes %u | %.3f ms",
+        mode.c_str(), st.Visible, st.Total, st.BoxTests, st.NodesVisited, st.TimeMs);
+
+    std::wstring s = stats;
+    if (mFreezeFrustum) s += L" | FROZEN[K]";
+    s += L" | Octree view[V] | Tess[T]:";
     s += mUseTessellation ? L"on" : L"off";
-    s += L" max[-/=]:" + std::to_wstring((int)mTessMaxFactor);
-    s += L" | Disp[B]:";
-    s += mUseDisplacement ? L"on" : L"off";
-    s += L" [ ]";
-    s += L" | NormalMap[N]:";
-    s += mUseNormalMap ? L"on" : L"off";
-    s += L" | Wire[M] | Sun[L] Flash[F] GBuf[G]";
+    s += L" Wire[M]";
     mMainWndCaption = s;
 }
 
@@ -494,19 +514,39 @@ void SponzaApp::Update(const GameTimer& gt)
 
     // Максимальный уровень тесселяции: '-' / '='
     if (KeyPressed(VK_OEM_MINUS)) { mTessMaxFactor = MathHelper::Max(1.0f, mTessMaxFactor / 2.0f);  captionDirty = true; }
-    if (KeyPressed(VK_OEM_PLUS)) { mTessMaxFactor = MathHelper::Min(64.0f, mTessMaxFactor * 2.0f); captionDirty = true; }
+    if (KeyPressed(VK_OEM_PLUS))  { mTessMaxFactor = MathHelper::Min(64.0f, mTessMaxFactor * 2.0f); captionDirty = true; }
 
     // Сила displacement: '[' / ']'
     if (GetAsyncKeyState(VK_OEM_4) & 0x8000) mDisplacementScale *= (1.0f - dt);
     if (GetAsyncKeyState(VK_OEM_6) & 0x8000) mDisplacementScale *= (1.0f + dt);
 
-    if (captionDirty)
-        UpdateCaption();
+    // Frustum culling
+    if (KeyPressed('C')) mCullingOn = !mCullingOn;
+    if (KeyPressed('O')) mUseOctree = !mUseOctree;
+    if (KeyPressed('V')) mShowOctree = !mShowOctree;
+    if (KeyPressed('K')) mFreezeFrustum = !mFreezeFrustum;
 
     if (mAnimEnabled)
         mAnimTime += dt;
 
     mCamera.UpdateViewMatrix();
+
+    // Фрустум камеры в мировых координатах: строим по матрице проекции (в пространстве камеры)
+    // и переносим в мир обратной матрицей вида
+    BoundingFrustum frustumV, frustumW;
+    BoundingFrustum::CreateFromMatrix(frustumV, mCamera.GetProj());
+    XMMATRIX view = mCamera.GetView();
+    XMVECTOR det = XMMatrixDeterminant(view);
+    frustumV.Transform(frustumW, XMMatrixInverse(&det, view));
+
+    if (!mFreezeFrustum)
+        mFrozenFrustum = frustumW;   // пока не заморожен — запоминаем текущий
+
+    const CullingMode mode = !mCullingOn ? CullingMode::None
+                           : (mUseOctree ? CullingMode::Octree : CullingMode::BruteForce);
+    mObjects.Update(mFreezeFrustum ? mFrozenFrustum : frustumW, mode, mShowOctree && mCullingOn && mUseOctree);
+
+    UpdateCaption();
 
     UpdateObjectCB();
     UpdateMaterialCB();
@@ -525,16 +565,16 @@ void SponzaApp::UpdateObjectCB()
     oc.EyePosW = mCamera.GetPosition3f();
 
     // Все расстояния — в долях размера сцены, чтобы работало при любом масштабе модели
-    oc.TessMinDist = 0.03f * mSceneSize;   // ближе — максимальная тесселяция
-    oc.TessMaxDist = 0.40f * mSceneSize;   // дальше — тесселяции нет
-    oc.TessMinFactor = 1.0f;
-    oc.TessMaxFactor = mTessMaxFactor;
+    oc.TessMinDist       = 0.03f * mSceneSize;   // ближе — максимальная тесселяция
+    oc.TessMaxDist       = 0.40f * mSceneSize;   // дальше — тесселяции нет
+    oc.TessMinFactor     = 1.0f;
+    oc.TessMaxFactor     = mTessMaxFactor;
     oc.TessMinEdgeLength = 0.003f * mSceneSize;
 
     oc.DisplacementScale = mDisplacementScale;
-    oc.UseNormalMap = mUseNormalMap ? 1u : 0u;
-    oc.UseDisplacement = mUseDisplacement ? 1u : 0u;
-    oc.UseTessellation = mUseTessellation ? 1u : 0u;
+    oc.UseNormalMap      = mUseNormalMap ? 1u : 0u;
+    oc.UseDisplacement   = mUseDisplacement ? 1u : 0u;
+    oc.UseTessellation   = mUseTessellation ? 1u : 0u;
 
     mObjectCB->CopyData(0, oc);
 }
@@ -597,6 +637,11 @@ void SponzaApp::Draw(const GameTimer& gt)
     scene.MaterialCB = mMaterialCB->Resource()->GetGPUVirtualAddress();
     scene.MaterialCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(SurfaceConstants));
     scene.SrvPerMaterial = 4;
+
+    // Объекты, прошедшие отсечение
+    scene.InstancedGeometry = mObjects.Geometry();
+    scene.InstanceBuffer = mObjects.InstanceBuffer();
+    scene.Batches = &mObjects.Batches();
 
     mRenderer.Render(mCommandList.Get(), scene, CurrentBackBufferView(), DepthStencilView());
 
@@ -749,7 +794,7 @@ void SponzaApp::LoadHeightTexture(const std::string& path, int& heightIdx, int& 
 void SponzaApp::BuildTextures()
 {
     // Текстуры по умолчанию (1x1)
-    mWhiteTex = AddTexture("#white", SolidImage(255, 255, 255, 255, 4));
+    mWhiteTex      = AddTexture("#white",  SolidImage(255, 255, 255, 255, 4));
     mFlatNormalTex = AddTexture("#normal", SolidImage(128, 128, 255, 255, 4));   // (0,0,1) — нормаль не меняется
     mGreyHeightTex = AddTexture("#height", SolidImage(128, 0, 0, 0, 1));         // 0.5 — нулевой сдвиг
 
@@ -787,22 +832,22 @@ void SponzaApp::BuildTextures()
 void SponzaApp::BuildMaterialSrvs()
 {
     auto createSrv = [&](int texIndex, UINT slot)
-        {
-            ID3D12Resource* res = mTextures[texIndex]->Resource.Get();
-            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Format = res->GetDesc().Format;
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = res->GetDesc().MipLevels;
-            md3dDevice->CreateShaderResourceView(res, &srvDesc, mRenderer.SceneSrvCpuHandle(slot));
-        };
+    {
+        ID3D12Resource* res = mTextures[texIndex]->Resource.Get();
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = res->GetDesc().Format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = res->GetDesc().MipLevels;
+        md3dDevice->CreateShaderResourceView(res, &srvDesc, mRenderer.SceneSrvCpuHandle(slot));
+    };
 
     for (UINT i = 0; i < (UINT)mMatTextures.size(); ++i)
     {
         createSrv(mMatTextures[i].Diffuse, i * 4 + 0);
-        createSrv(mMatTextures[i].Alpha, i * 4 + 1);
-        createSrv(mMatTextures[i].Normal, i * 4 + 2);
-        createSrv(mMatTextures[i].Height, i * 4 + 3);
+        createSrv(mMatTextures[i].Alpha,   i * 4 + 1);
+        createSrv(mMatTextures[i].Normal,  i * 4 + 2);
+        createSrv(mMatTextures[i].Height,  i * 4 + 3);
     }
 }
 
@@ -848,18 +893,18 @@ void SponzaApp::BuildLights()
     mMoveSpeed = longSize / 10.0f;
 
     auto P = [&](float a, float h, float b) -> XMFLOAT3
-        {
-            if (longAlongX)
-                return { bmin.x + a * size.x, bmin.y + h * size.y, bmin.z + b * size.z };
-            return { bmin.x + b * size.x, bmin.y + h * size.y, bmin.z + a * size.z };
-        };
+    {
+        if (longAlongX)
+            return { bmin.x + a * size.x, bmin.y + h * size.y, bmin.z + b * size.z };
+        return { bmin.x + b * size.x, bmin.y + h * size.y, bmin.z + a * size.z };
+    };
 
     auto normalized = [](XMFLOAT3 v) -> XMFLOAT3
-        {
-            XMFLOAT3 r;
-            XMStoreFloat3(&r, XMVector3Normalize(XMLoadFloat3(&v)));
-            return r;
-        };
+    {
+        XMFLOAT3 r;
+        XMStoreFloat3(&r, XMVector3Normalize(XMLoadFloat3(&v)));
+        return r;
+    };
 
     auto& lights = mRenderer.Lights();
     lights.clear();

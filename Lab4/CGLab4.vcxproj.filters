@@ -12,6 +12,8 @@
     <ClCompile Include="Model.cpp" />
     <ClCompile Include="GBuffer.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
+    <ClCompile Include="Octree.cpp" />
+    <ClCompile Include="SceneObjects.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common\Camera.h" />
@@ -27,6 +29,8 @@
     <ClInclude Include="tiny_obj_loader.h" />
     <ClInclude Include="GBuffer.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="Octree.h" />
+    <ClInclude Include="SceneObjects.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Shaders\sponza.hlsl" />
