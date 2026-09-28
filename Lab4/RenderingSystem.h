@@ -7,6 +7,8 @@
 #include <vector>
 #include <memory>
 
+class ParticleSystem;   // лаба 6: рисуется в geometry pass
+
 // Типы источников (совпадают с #define в Shaders/DeferredLighting.hlsl)
 enum LightType : int
 {
@@ -56,6 +58,37 @@ struct LightingPassConstants
     LightData Lights[kMaxDeferredLights];
 };
 
+// Константы пост-обработки (b0 в Shaders/PostProcess.hlsl) — порядок полей важен!
+struct PostConstants
+{
+    DirectX::XMFLOAT3 EyePosW = { 0.0f, 0.0f, 0.0f };
+    float Time = 0.0f;
+
+    DirectX::XMFLOAT4 FogColor = { 0.70f, 0.74f, 0.80f, 1.0f };
+
+    float FogStart = 10.0f;            // с какого расстояния начинается туман
+    float FogEnd = 100.0f;             // где он максимален
+    float FogBaseY = 0.0f;             // уровень пола
+    float FogHeightFalloff = 0.1f;     // как быстро туман редеет с высотой
+
+    float FogDensity = 0.85f;          // максимальная плотность
+    float OutlineThickness = 1.0f;     // толщина контура в пикселях
+    float OutlineDepthScale = 12.0f;   // чувствительность к перепаду глубины
+    float OutlineNormalScale = 1.5f;   // чувствительность к перепаду нормалей
+
+    DirectX::XMFLOAT4 OutlineColor = { 0.05f, 0.04f, 0.03f, 1.0f };
+
+    float VignetteStrength = 0.55f;
+    float ChromaticAmount = 0.006f;
+    float InvWidth = 1.0f / 1280.0f;
+    float InvHeight = 1.0f / 720.0f;
+
+    UINT FogEnabled = 1;
+    UINT OutlineEnabled = 1;
+    UINT VignetteEnabled = 1;
+    UINT ChromaticEnabled = 1;
+};
+
 // Один вызов инстансинга
 struct InstancedBatch
 {
@@ -90,6 +123,9 @@ struct SceneDrawData
     // Экранный viewport — восстанавливается после shadow pass
     D3D12_VIEWPORT ScreenViewport = {};
     D3D12_RECT ScissorRect = {};
+
+    // Частицы (непрозрачные, пишутся в G-буфер); nullptr — не рисовать
+    ParticleSystem* Particles = nullptr;
 };
 
 // Deferred rendering:
@@ -135,6 +171,9 @@ public:
     const DirectX::XMFLOAT4X4& CascadeViewProj(UINT i) const { return mShadowMap.ViewProj(i); }
     float CascadeSplitFar(UINT i) const { return mShadowMap.SplitFar(i); }
 
+    // ---- Пост-обработка ----
+    PostConstants& Post() { return mPost; }
+
     void UpdatePassConstants(const DirectX::XMFLOAT3& eyePosW);
 
     void Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
@@ -143,6 +182,7 @@ public:
 private:
     void BuildRootSignatures();
     void BuildShadersAndPSOs();
+    void BuildSceneColor(UINT width, UINT height);
     void RenderShadowPass(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene);
 
 private:
@@ -180,4 +220,17 @@ private:
     LightingPassConstants mPass;
     std::vector<LightData> mLights;
     bool mWireframe = false;
+
+    // ---- Пост-обработка ----
+    // Lighting pass рисует в mSceneColor, пост-проход читает её (+ G-буфер) и пишет в back buffer.
+    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap][SceneColor]
+    UINT mWidth = 0;
+    UINT mHeight = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> mSceneColor;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mSceneColorRtvHeap;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> mPostRootSig;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> mPostPSO;
+    Microsoft::WRL::ComPtr<ID3DBlob> mPostVS, mPostPS;
+    std::unique_ptr<UploadBuffer<PostConstants>> mPostCB;
+    PostConstants mPost;
 };

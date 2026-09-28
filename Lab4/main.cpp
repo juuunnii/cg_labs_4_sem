@@ -5,6 +5,7 @@
 #include "Model.h"
 #include "RenderingSystem.h"
 #include "SceneObjects.h"
+#include "ParticleSystem.h"
 
 #include <wincodec.h>
 #include <unordered_map>
@@ -380,6 +381,10 @@ private:
     float mCascadeLambda = 0.8f;     // , / . — насколько нелинейно разбиение (0 — равномерно, 1 — логарифм)
     float mShadowDistance = 100.0f;  // до какой глубины от камеры строятся тени
     BoundingBox mSceneBounds;
+
+    // ---------- Лаба 6: система частиц на GPU ----------
+    static const UINT kMaxParticles = 131072;   // если тормозит — уменьшите до 32768
+    ParticleSystem mParticles;
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -448,6 +453,23 @@ bool SponzaApp::Initialize()
     mObjects.Build(md3dDevice.Get(), mCommandList.Get(),
         mSponza->GetBoundsMin(), mSponza->GetBoundsMax(), kObjectCount);
 
+    // Частицы: три фонтана вдоль центральной линии атриума, на уровне пола
+    mParticles.Initialize(md3dDevice.Get(), mCommandList.Get(), kMaxParticles, mDepthStencilFormat);
+    {
+        const XMFLOAT3 bmin = mSponza->GetBoundsMin();
+        const XMFLOAT3 bmax = mSponza->GetBoundsMax();
+        const XMFLOAT3 size = { bmax.x - bmin.x, bmax.y - bmin.y, bmax.z - bmin.z };
+        const bool alongX = size.x >= size.z;
+
+        std::vector<XMFLOAT3> fountains;
+        for (float a : { 0.3f, 0.5f, 0.7f })
+        {
+            if (alongX) fountains.push_back({ bmin.x + a * size.x, bmin.y, bmin.z + 0.5f * size.z });
+            else        fountains.push_back({ bmin.x + 0.5f * size.x, bmin.y, bmin.z + a * size.z });
+        }
+        mParticles.SetEmitters(fountains, bmin.y, size.y, alongX ? size.x : size.z);
+    }
+
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
     mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
@@ -458,6 +480,7 @@ bool SponzaApp::Initialize()
     if (mSponzaGeo)
         mSponzaGeo->DisposeUploaders();
     mObjects.DisposeUploaders();
+    mParticles.DisposeUploaders();
 
     UpdateCaption();
     return true;
@@ -482,13 +505,15 @@ bool SponzaApp::KeyPressed(int vk)
 
 void SponzaApp::UpdateCaption()
 {
+    const PostConstants& post = mRenderer.Post();
     wchar_t buf[256];
     swprintf_s(buf,
-        L"Shadows[J]:%s | PCF[P]:%ux%u | lambda[,/.]:%.2f | Cascades[H]:%s | splits %.0f / %.0f / %.0f / %.0f",
-        mShadowsOn ? L"on" : L"off", mPcfKernel, mPcfKernel, mCascadeLambda,
-        mShowCascades ? L"on" : L"off",
-        mRenderer.CascadeSplitFar(0), mRenderer.CascadeSplitFar(1),
-        mRenderer.CascadeSplitFar(2), mRenderer.CascadeSplitFar(3));
+        L"Post[I] | Outline[Z]:%s | Fog[X]:%s | Vignette+CA[U]:%s | Particles: %u | Shadows[J]:%s",
+        post.OutlineEnabled ? L"on" : L"off",
+        post.FogEnabled ? L"on" : L"off",
+        post.VignetteEnabled ? L"on" : L"off",
+        mParticles.AliveCount(),
+        mShadowsOn ? L"on" : L"off");
     mMainWndCaption = buf;
 }
 
@@ -542,6 +567,29 @@ void SponzaApp::Update(const GameTimer& gt)
     mRenderer.SetShowCascades(mShowCascades);
     mRenderer.SetPcfKernel(mPcfKernel);
 
+    // Частицы: предыдущий кадр уже завершён (FlushCommandQueue), счётчик можно прочитать
+    mParticles.ReadBackAliveCount();
+    if (KeyPressed('E')) mParticles.SetEmitting(!mParticles.Emitting());
+    if (GetAsyncKeyState('8') & 0x8000) mParticles.SetEmitRate(MathHelper::Max(500.0f, mParticles.EmitRate() * (1.0f - dt)));
+    if (GetAsyncKeyState('9') & 0x8000) mParticles.SetEmitRate(MathHelper::Min(100000.0f, mParticles.EmitRate() * (1.0f + dt)));
+
+    // Пост-обработка
+    PostConstants& post = mRenderer.Post();
+    if (KeyPressed('Z')) post.OutlineEnabled ^= 1u;                 // контуры
+    if (KeyPressed('X')) post.FogEnabled ^= 1u;                     // туман
+    if (KeyPressed('U'))                                            // виньетка + аберрация
+    {
+        post.VignetteEnabled ^= 1u;
+        post.ChromaticEnabled = post.VignetteEnabled;
+    }
+    if (KeyPressed('I'))                                            // всё вкл/выкл — сравнить «до/после»
+    {
+        const UINT anyOn = post.OutlineEnabled | post.FogEnabled | post.VignetteEnabled;
+        const UINT v = anyOn ? 0u : 1u;
+        post.OutlineEnabled = post.FogEnabled = post.VignetteEnabled = post.ChromaticEnabled = v;
+    }
+    post.Time = gt.TotalTime();
+
     if (mAnimEnabled)
         mAnimTime += dt;
 
@@ -567,6 +615,14 @@ void SponzaApp::Update(const GameTimer& gt)
         mCamera.GetFovY(), mCamera.GetAspect(), mCamera.GetNearZ(),
         mShadowDistance, mCascadeLambda,
         mRenderer.Lights()[mSunIndex].Direction, mSceneBounds);
+
+    // Константы частиц: сколько родить, камера (для разворота билбордов к зрителю)
+    {
+        XMFLOAT4X4 viewProj;
+        XMStoreFloat4x4(&viewProj, mCamera.GetView() * mCamera.GetProj());
+        mParticles.Update(dt, gt.TotalTime(), viewProj, mCamera.GetPosition3f(),
+            mCamera.GetRight3f(), mCamera.GetUp3f());
+    }
 
     UpdateCaption();
 
@@ -683,6 +739,10 @@ void SponzaApp::Draw(const GameTimer& gt)
 
     scene.ScreenViewport = mScreenViewport;
     scene.ScissorRect = mScissorRect;
+
+    // Лаба 6: сначала compute-шейдеры обновляют частицы, потом geometry pass их рисует
+    mParticles.Simulate(mCommandList.Get());
+    scene.Particles = &mParticles;
 
     mRenderer.Render(mCommandList.Get(), scene, CurrentBackBufferView(), DepthStencilView());
 
@@ -1022,4 +1082,11 @@ void SponzaApp::BuildLights()
     mRenderer.SetShadowLightIndex((int)mSunIndex);
     mShadowDistance = 0.8f * longSize;
     BoundingBox::CreateFromPoints(mSceneBounds, XMLoadFloat3(&bmin), XMLoadFloat3(&bmax));
+
+    // Пост-обработка: туман в долях размеров сцены
+    PostConstants& post = mRenderer.Post();
+    post.FogStart = 0.05f * longSize;
+    post.FogEnd = 0.9f * longSize;
+    post.FogBaseY = bmin.y;
+    post.FogHeightFalloff = 3.0f / size.y;   // к верху здания туман заметно реже
 }

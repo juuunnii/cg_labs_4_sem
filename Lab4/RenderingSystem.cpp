@@ -1,4 +1,5 @@
 #include "RenderingSystem.h"
+#include "ParticleSystem.h"
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -30,10 +31,10 @@ void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
     mNumSceneSrvs = numSceneSrvs;
     mSrvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // Куча: [текстуры сцены ...][Albedo][Normal][Position][ShadowMap]
-    // G-буфер и карта теней лежат подряд — в lighting pass это одна таблица t0..t3
+    // Куча: [текстуры сцены ...][Albedo][Normal][Position][ShadowMap][SceneColor]
+    // G-буфер, карта теней и цвет сцены лежат подряд — удобно брать одной таблицей
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = numSceneSrvs + GBuffer::Count + 1;
+    heapDesc.NumDescriptors = numSceneSrvs + GBuffer::Count + 2;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mSrvHeap)));
@@ -48,14 +49,58 @@ void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
     mPass.ShadowMapSize = (float)kShadowMapSize;
 
     mPassCB = std::make_unique<UploadBuffer<LightingPassConstants>>(device, 1, true);
+    mPostCB = std::make_unique<UploadBuffer<PostConstants>>(device, 1, true);
+
+    // RTV для текстуры «цвет сцены»
+    D3D12_DESCRIPTOR_HEAP_DESC rtvDesc = {};
+    rtvDesc.NumDescriptors = 1;
+    rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    ThrowIfFailed(mDevice->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&mSceneColorRtvHeap)));
+    BuildSceneColor(width, height);
 
     BuildRootSignatures();
     BuildShadersAndPSOs();
 }
 
+// Промежуточная текстура: сюда рисует lighting pass, отсюда читает пост-обработка
+void RenderingSystem::BuildSceneColor(UINT width, UINT height)
+{
+    if (width == 0 || height == 0)
+        return;
+
+    mWidth = width;
+    mHeight = height;
+    mPost.InvWidth = 1.0f / (float)width;
+    mPost.InvHeight = 1.0f / (float)height;
+
+    mSceneColor.Reset();
+
+    CD3DX12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Tex2D(mBackBufferFormat, width, height, 1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    CD3DX12_CLEAR_VALUE clear(mBackBufferFormat, black);
+    CD3DX12_HEAP_PROPERTIES heap(D3D12_HEAP_TYPE_DEFAULT);
+    ThrowIfFailed(mDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&mSceneColor)));
+
+    mDevice->CreateRenderTargetView(mSceneColor.Get(), nullptr,
+        mSceneColorRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = mBackBufferFormat;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE h(mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+        (INT)(mNumSceneSrvs + GBuffer::Count + 1), mSrvDescriptorSize);
+    mDevice->CreateShaderResourceView(mSceneColor.Get(), &srv, h);
+}
+
 void RenderingSystem::OnResize(UINT width, UINT height)
 {
     mGBuffer.OnResize(width, height);
+    if (width != mWidth || height != mHeight)
+        BuildSceneColor(width, height);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE RenderingSystem::SceneSrvCpuHandle(UINT index) const
@@ -90,6 +135,9 @@ void RenderingSystem::UpdatePassConstants(const XMFLOAT3& eyePosW)
         mPass.Lights[i] = mLights[i];
 
     mPassCB->CopyData(0, mPass);
+
+    mPost.EyePosW = eyePosW;
+    mPostCB->CopyData(0, mPost);
 }
 
 void RenderingSystem::BuildRootSignatures()
@@ -150,6 +198,24 @@ void RenderingSystem::BuildRootSignatures()
         CD3DX12_ROOT_SIGNATURE_DESC desc(2, params, 1, &shadowSampler,
             D3D12_ROOT_SIGNATURE_FLAG_NONE);
         mLightingRootSig = CreateRootSignature(mDevice, desc);
+    }
+
+    // ---------- Пост-обработка: t0..t2 G-буфер, (t3 тени — не нужны), t4 цвет сцены; b0 параметры ----------
+    {
+        CD3DX12_DESCRIPTOR_RANGE table;
+        table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::Count + 2, 0);
+
+        CD3DX12_ROOT_PARAMETER params[2];
+        params[0].InitAsDescriptorTable(1, &table, D3D12_SHADER_VISIBILITY_PIXEL);
+        params[1].InitAsConstantBufferView(0);
+
+        CD3DX12_STATIC_SAMPLER_DESC linearClamp(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
+        CD3DX12_ROOT_SIGNATURE_DESC desc(2, params, 1, &linearClamp,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        mPostRootSig = CreateRootSignature(mDevice, desc);
     }
 }
 
@@ -268,6 +334,16 @@ void RenderingSystem::BuildShadersAndPSOs()
     light.DSVFormat = DXGI_FORMAT_UNKNOWN;
     light.SampleDesc.Count = 1;
     ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&light, IID_PPV_ARGS(&mLightingPSO)));
+
+    // ---------- Пост-обработка: полноэкранный квад без вершинного буфера ----------
+    mPostVS = d3dUtil::CompileShader(L"Shaders/PostProcess.hlsl", nullptr, "VS", "vs_5_0");
+    mPostPS = d3dUtil::CompileShader(L"Shaders/PostProcess.hlsl", nullptr, "PS", "ps_5_0");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC post = light;   // те же настройки: без глубины, 1 RT
+    post.pRootSignature = mPostRootSig.Get();
+    post.VS = { mPostVS->GetBufferPointer(), mPostVS->GetBufferSize() };
+    post.PS = { mPostPS->GetBufferPointer(), mPostPS->GetBufferSize() };
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&post, IID_PPV_ARGS(&mPostPSO)));
 }
 
 void RenderingSystem::RenderShadowPass(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene)
@@ -402,12 +478,21 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
         }
     }
 
+    // Частицы — непрозрачные, поэтому идут в тот же G-буфер с тестом глубины (сортировка не нужна)
+    if (scene.Particles)
+        scene.Particles->Draw(cmdList);
+
     mGBuffer.EndGeometryPass(cmdList);
 
     //==================================================================
-    // 2. LIGHTING PASS — свет + каскадные тени
+    // 2. LIGHTING PASS — свет + каскадные тени -> текстура «цвет сцены»
     //==================================================================
-    cmdList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);
+    CD3DX12_RESOURCE_BARRIER toRT = CD3DX12_RESOURCE_BARRIER::Transition(mSceneColor.Get(),
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmdList->ResourceBarrier(1, &toRT);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE sceneColorRtv = mSceneColorRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    cmdList->OMSetRenderTargets(1, &sceneColorRtv, TRUE, nullptr);
 
     cmdList->SetPipelineState(mLightingPSO.Get());
     cmdList->SetGraphicsRootSignature(mLightingRootSig.Get());
@@ -419,4 +504,22 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
 
     cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmdList->DrawInstanced(3, 1, 0, 0);
+
+    CD3DX12_RESOURCE_BARRIER toSRV = CD3DX12_RESOURCE_BARRIER::Transition(mSceneColor.Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmdList->ResourceBarrier(1, &toSRV);
+
+    //==================================================================
+    // 3. POST-PROCESS — полноэкранный квад: цвет сцены + G-буфер -> back buffer
+    //==================================================================
+    cmdList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);
+
+    cmdList->SetPipelineState(mPostPSO.Get());
+    cmdList->SetGraphicsRootSignature(mPostRootSig.Get());
+    cmdList->SetGraphicsRootDescriptorTable(0, gbufferSrv);   // t0..t2 G-буфер, t4 цвет сцены
+    cmdList->SetGraphicsRootConstantBufferView(1, mPostCB->Resource()->GetGPUVirtualAddress());
+
+    // 4 вершины triangle strip = прямоугольник на весь экран; координаты строит VS по SV_VertexID
+    cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    cmdList->DrawInstanced(4, 1, 0, 0);
 }
