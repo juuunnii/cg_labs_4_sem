@@ -51,11 +51,11 @@ struct SceneDrawData
     D3D12_GPU_VIRTUAL_ADDRESS ObjectCB = 0;       // b0
     D3D12_GPU_VIRTUAL_ADDRESS MaterialCB = 0;     // начало буфера материалов (b1)
     UINT MaterialCBByteSize = 0;
-    UINT SrvPerMaterial = 2;                      // сколько SRV подряд у каждого материала
+    UINT SrvPerMaterial = 4;                      // diffuse, mask, normal, height
 };
 
-// Deferred rendering:
-//   1) Geometry pass: сцена рисуется в G-буфер (albedo, нормаль, позиция)
+// Deferred rendering с тесселяцией:
+//   1) Geometry pass: VS -> HS -> тесселятор -> DS (displacement) -> PS (normal map) -> G-буфер
 //   2) Lighting pass: полноэкранный треугольник, для каждого пикселя
 //      читается G-буфер и суммируется вклад всех источников света
 class RenderingSystem
@@ -64,8 +64,8 @@ public:
     // numSceneSrvs — сколько дескрипторов нужно под текстуры сцены.
     // Они лежат в начале общей кучи, за ними — 3 SRV G-буфера.
     void Initialize(ID3D12Device* device, UINT width, UINT height,
-                    DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
-                    UINT numSceneSrvs);
+        DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
+        UINT numSceneSrvs);
 
     void OnResize(UINT width, UINT height);
 
@@ -74,18 +74,21 @@ public:
 
     std::vector<LightData>& Lights() { return mLights; }
 
-    void SetAmbient(const DirectX::XMFLOAT4& c)  { mPass.Ambient = c; }
+    void SetAmbient(const DirectX::XMFLOAT4& c) { mPass.Ambient = c; }
     void SetSkyColor(const DirectX::XMFLOAT4& c) { mPass.SkyColor = c; }
-    void SetPositionScale(float s)               { mPass.PositionScale = s; }
-    void SetDebugView(UINT v)                    { mPass.DebugView = v % 4; }
-    UINT DebugView() const                       { return mPass.DebugView; }
+    void SetPositionScale(float s) { mPass.PositionScale = s; }
+    void SetDebugView(UINT v) { mPass.DebugView = v % 4; }
+    UINT DebugView() const { return mPass.DebugView; }
+
+    void SetWireframe(bool w) { mWireframe = w; }
+    bool Wireframe() const { return mWireframe; }
 
     // Раз в кадр: переносит источники и позицию камеры в константный буфер
     void UpdatePassConstants(const DirectX::XMFLOAT3& eyePosW);
 
     // Back buffer к этому моменту должен быть в состоянии RENDER_TARGET
     void Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
-                D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv);
+        D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv);
 
 private:
     void BuildRootSignatures();
@@ -105,12 +108,14 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> mGeometryRootSig;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> mLightingRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mGeometryPSO;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> mGeometryWirePSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mLightingPSO;
 
-    Microsoft::WRL::ComPtr<ID3DBlob> mGeometryVS, mGeometryPS;
+    Microsoft::WRL::ComPtr<ID3DBlob> mGeometryVS, mGeometryHS, mGeometryDS, mGeometryPS;
     Microsoft::WRL::ComPtr<ID3DBlob> mLightingVS, mLightingPS;
 
     std::unique_ptr<UploadBuffer<LightingPassConstants>> mPassCB;
     LightingPassConstants mPass;
     std::vector<LightData> mLights;
+    bool mWireframe = false;
 };

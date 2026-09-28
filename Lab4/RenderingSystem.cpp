@@ -4,7 +4,7 @@ using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
 static ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device,
-                                                       const CD3DX12_ROOT_SIGNATURE_DESC& desc)
+    const CD3DX12_ROOT_SIGNATURE_DESC& desc)
 {
     ComPtr<ID3DBlob> serialized;
     ComPtr<ID3DBlob> errors;
@@ -21,8 +21,8 @@ static ComPtr<ID3D12RootSignature> CreateRootSignature(ID3D12Device* device,
 }
 
 void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
-                                 DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
-                                 UINT numSceneSrvs)
+    DXGI_FORMAT backBufferFormat, DXGI_FORMAT depthFormat,
+    UINT numSceneSrvs)
 {
     mDevice = device;
     mBackBufferFormat = backBufferFormat;
@@ -70,21 +70,30 @@ void RenderingSystem::UpdatePassConstants(const XMFLOAT3& eyePosW)
 
 void RenderingSystem::BuildRootSignatures()
 {
-    // ---------- Geometry pass: t0 diffuse, t1 mask, b0 объект, b1 материал, s0 сэмплер ----------
+    // ---------- Geometry pass: t0 diffuse, t1 mask, t2 normal, t3 height; b0 кадр, b1 материал ----------
+    // Видимость ALL: карту высот читает domain shader, остальные — pixel shader
     {
         CD3DX12_DESCRIPTOR_RANGE texTable;
-        texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);
+        texTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0);
 
         CD3DX12_ROOT_PARAMETER params[3];
-        params[0].InitAsDescriptorTable(1, &texTable, D3D12_SHADER_VISIBILITY_PIXEL);
+        params[0].InitAsDescriptorTable(1, &texTable, D3D12_SHADER_VISIBILITY_ALL);
         params[1].InitAsConstantBufferView(0);
         params[2].InitAsConstantBufferView(1);
 
-        CD3DX12_STATIC_SAMPLER_DESC anisotropicWrap(0, D3D12_FILTER_ANISOTROPIC,
-            D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
-            D3D12_TEXTURE_ADDRESS_MODE_WRAP, 0.0f, 8);
+        CD3DX12_STATIC_SAMPLER_DESC samplers[2] =
+        {
+            // s0 — для обычных текстур в pixel shader
+            CD3DX12_STATIC_SAMPLER_DESC(0, D3D12_FILTER_ANISOTROPIC,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP, 0.0f, 8),
+                // s1 — для SampleLevel в domain shader
+                CD3DX12_STATIC_SAMPLER_DESC(1, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                    D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                    D3D12_TEXTURE_ADDRESS_MODE_WRAP)
+        };
 
-        CD3DX12_ROOT_SIGNATURE_DESC desc(3, params, 1, &anisotropicWrap,
+        CD3DX12_ROOT_SIGNATURE_DESC desc(3, params, 2, samplers,
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
         mGeometryRootSig = CreateRootSignature(mDevice, desc);
     }
@@ -107,29 +116,34 @@ void RenderingSystem::BuildRootSignatures()
 void RenderingSystem::BuildShadersAndPSOs()
 {
     mGeometryVS = d3dUtil::CompileShader(L"Shaders/GBuffer.hlsl", nullptr, "VS", "vs_5_0");
+    mGeometryHS = d3dUtil::CompileShader(L"Shaders/GBuffer.hlsl", nullptr, "HS", "hs_5_0");
+    mGeometryDS = d3dUtil::CompileShader(L"Shaders/GBuffer.hlsl", nullptr, "DS", "ds_5_0");
     mGeometryPS = d3dUtil::CompileShader(L"Shaders/GBuffer.hlsl", nullptr, "PS", "ps_5_0");
     mLightingVS = d3dUtil::CompileShader(L"Shaders/DeferredLighting.hlsl", nullptr, "VS", "vs_5_0");
     mLightingPS = d3dUtil::CompileShader(L"Shaders/DeferredLighting.hlsl", nullptr, "PS", "ps_5_0");
 
-    // ---------- Geometry pass PSO: 3 render target'а + глубина ----------
+    // ---------- Geometry pass PSO: тесселяция, 3 render target'а + глубина ----------
     static const D3D12_INPUT_ELEMENT_DESC inputLayout[] =
     {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TANGENT",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC geo = {};
     geo.InputLayout = { inputLayout, _countof(inputLayout) };
     geo.pRootSignature = mGeometryRootSig.Get();
     geo.VS = { mGeometryVS->GetBufferPointer(), mGeometryVS->GetBufferSize() };
+    geo.HS = { mGeometryHS->GetBufferPointer(), mGeometryHS->GetBufferSize() };
+    geo.DS = { mGeometryDS->GetBufferPointer(), mGeometryDS->GetBufferSize() };
     geo.PS = { mGeometryPS->GetBufferPointer(), mGeometryPS->GetBufferSize() };
     geo.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
     geo.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;   // листья и ткани — одинарные плоскости
     geo.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
     geo.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
     geo.SampleMask = UINT_MAX;
-    geo.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    geo.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;   // вход тесселяции — патчи
     geo.NumRenderTargets = GBuffer::Count;
     for (UINT i = 0; i < GBuffer::Count; ++i)
         geo.RTVFormats[i] = GBuffer::Format(i);
@@ -137,6 +151,11 @@ void RenderingSystem::BuildShadersAndPSOs()
     geo.SampleDesc.Count = 1;
     geo.SampleDesc.Quality = 0;
     ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&geo, IID_PPV_ARGS(&mGeometryPSO)));
+
+    // Тот же PSO, но каркасом — чтобы видеть, как меняется тесселяция с расстоянием
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC wire = geo;
+    wire.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&wire, IID_PPV_ARGS(&mGeometryWirePSO)));
 
     // ---------- Lighting pass PSO: полноэкранный треугольник, без вершинного буфера и глубины ----------
     D3D12_GRAPHICS_PIPELINE_STATE_DESC light = {};
@@ -161,7 +180,7 @@ void RenderingSystem::BuildShadersAndPSOs()
 }
 
 void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
-                             D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv)
+    D3D12_CPU_DESCRIPTOR_HANDLE backBufferRtv, D3D12_CPU_DESCRIPTOR_HANDLE dsv)
 {
     ID3D12DescriptorHeap* heaps[] = { mSrvHeap.Get() };
     cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
@@ -172,7 +191,7 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
     cmdList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
     mGBuffer.BeginGeometryPass(cmdList, dsv);
 
-    cmdList->SetPipelineState(mGeometryPSO.Get());
+    cmdList->SetPipelineState(mWireframe ? mGeometryWirePSO.Get() : mGeometryPSO.Get());
     cmdList->SetGraphicsRootSignature(mGeometryRootSig.Get());
     cmdList->SetGraphicsRootConstantBufferView(1, scene.ObjectCB);
 
@@ -182,7 +201,8 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
         D3D12_INDEX_BUFFER_VIEW ibv = scene.Geometry->IndexBufferView();
         cmdList->IASetVertexBuffers(0, 1, &vbv);
         cmdList->IASetIndexBuffer(&ibv);
-        cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        // Каждый треугольник — патч из 3 контрольных точек для hull shader
+        cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
 
         for (const ModelSubset& subset : *scene.Subsets)
         {
