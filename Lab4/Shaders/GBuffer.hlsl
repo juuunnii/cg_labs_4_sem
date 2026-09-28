@@ -5,8 +5,8 @@
 //   DS  — вершины после тесселятора сдвигаются по нормали на значение из карты высот
 //   PS  — normal mapping + запись в G-буфер
 //
-//   SV_Target0  Albedo    (цвет текстуры, sRGB)
-//   SV_Target1  Normal    (мировая нормаль с учётом карты нормалей)
+//   SV_Target0  Albedo    (цвет текстуры, sRGB; a = roughness)
+//   SV_Target1  Normal    (мировая нормаль с учётом карты нормалей; w = metallic)
 //   SV_Target2  Position  (мировая позиция, w = 1)
 //======================================================================================
 
@@ -44,7 +44,9 @@ cbuffer cbMaterial : register(b1)
     float4   gDiffuseAlbedo;
     float4x4 gMatTransform;       // тайлинг + анимация UV
     float    gMaterialDisplacement;   // 0 — материал не выдавливается (листья, ткани без карты)
-    float3   gMatPad;
+    float    gRoughness;              // лаба 8 (PBR): шероховатость
+    float    gMetallic;               // лаба 8 (PBR): металличность
+    float    gMatPad;
 };
 
 struct VertexIn
@@ -223,8 +225,9 @@ GBufferOutput PS(DomainOut pin, bool isFrontFace : SV_IsFrontFace)
         N = -N;
 
     GBufferOutput o;
-    o.Albedo   = float4(texColor.rgb * gDiffuseAlbedo.rgb, 1.0f);
-    o.Normal   = float4(N, 0.0f);
+    // PBR-параметры упакованы в свободные каналы: roughness -> Albedo.a, metallic -> Normal.w
+    o.Albedo   = float4(texColor.rgb * gDiffuseAlbedo.rgb, gRoughness);
+    o.Normal   = float4(N, gMetallic);
     o.Position = float4(pin.PosW, 1.0f);
     return o;
 }

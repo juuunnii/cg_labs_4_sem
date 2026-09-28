@@ -12,8 +12,8 @@
 Texture2D gAlbedoMap   : register(t0);   // цвет поверхности
 Texture2D gNormalMap   : register(t1);   // мировая нормаль
 Texture2D gPositionMap : register(t2);   // мировая позиция, w = 1 если есть геометрия
-// t3 — карта теней (здесь не используется)
-Texture2D gSceneColor  : register(t4);   // освещённая картинка
+// t3 — карта теней, t4..t6 — IBL (здесь не используются)
+Texture2D gSceneColor  : register(t7);   // освещённая картинка (t4..t6 — карты IBL)
 
 SamplerState gsamLinearClamp : register(s0);
 

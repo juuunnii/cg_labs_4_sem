@@ -8,6 +8,7 @@ struct InstanceData
 {
     float4x4 World;
     float4   Color;
+    float4   Surface;   // лаба 8: x = roughness, y = metallic
 };
 
 StructuredBuffer<InstanceData> gInstances : register(t0);
@@ -37,6 +38,7 @@ struct VertexOut
     float3 PosW    : POSITION;
     float3 NormalW : NORMAL;
     nointerpolation float4 Color : COLOR;
+    nointerpolation float2 Surface : SURFACE;
 };
 
 VertexOut VS(VertexIn vin, uint instanceID : SV_InstanceID)
@@ -49,6 +51,7 @@ VertexOut VS(VertexIn vin, uint instanceID : SV_InstanceID)
     vout.PosH     = mul(posW, gViewProj);
     vout.NormalW  = mul(vin.NormalL, (float3x3)inst.World);   // масштаб равномерный — так можно
     vout.Color    = inst.Color;
+    vout.Surface  = inst.Surface.xy;
     return vout;
 }
 
@@ -62,8 +65,9 @@ struct GBufferOutput
 GBufferOutput PS(VertexOut pin)
 {
     GBufferOutput o;
-    o.Albedo   = float4(pin.Color.rgb, 1.0f);
-    o.Normal   = float4(normalize(pin.NormalW), 0.0f);
+    // PBR: roughness — в альфу альбедо, metallic — в w нормали
+    o.Albedo   = float4(pin.Color.rgb, pin.Surface.x);
+    o.Normal   = float4(normalize(pin.NormalW), pin.Surface.y);
     o.Position = float4(pin.PosW, 1.0f);
     return o;
 }

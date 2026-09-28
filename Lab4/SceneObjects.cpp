@@ -113,6 +113,11 @@ void SceneObjects::Build(ID3D12Device* device, ID3D12GraphicsCommandList* cmdLis
         XMStoreFloat4x4(&o.World, world);
         o.Color = HueToColor(uni(rng));
 
+        // Лаба 8 (PBR): каждый третий объект — металл, шероховатость случайная
+        const float roughness = 0.05f + 0.9f * uni(rng);
+        const float metallic = (i % 3 == 0) ? 1.0f : 0.0f;
+        o.Surface = XMFLOAT4(roughness, metallic, 0.0f, 0.0f);
+
         // AABB объекта в мире = локальный куб, преобразованный матрицей объекта
         localBox.Transform(mBounds[i], world);
     }
@@ -137,6 +142,7 @@ void SceneObjects::Build(ID3D12Device* device, ID3D12GraphicsCommandList* cmdLis
             InstanceData d;
             XMStoreFloat4x4(&d.World, XMMatrixTranspose(XMLoadFloat4x4(&o.World)));
             d.Color = o.Color;
+            d.Surface = o.Surface;
             mInstanceBuffer->CopyData((int)offset++, d);
         }
         if (offset > start)
@@ -223,6 +229,7 @@ void SceneObjects::Update(const BoundingFrustum& frustumW, CullingMode mode, boo
             InstanceData d;
             XMStoreFloat4x4(&d.World, XMMatrixTranspose(XMLoadFloat4x4(&o.World)));
             d.Color = o.Color;
+            d.Surface = o.Surface;
             mInstanceBuffer->CopyData((int)offset++, d);
         }
 
@@ -253,6 +260,7 @@ void SceneObjects::Update(const BoundingFrustum& frustumW, CullingMode mode, boo
             InstanceData d;
             XMStoreFloat4x4(&d.World, XMMatrixTranspose(world));
             d.Color = XMFLOAT4(1.0f, 1.0f, 0.2f, 1.0f);
+            d.Surface = XMFLOAT4(1.0f, 0.0f, 0.0f, 0.0f);
             mInstanceBuffer->CopyData((int)offset++, d);
         }
 

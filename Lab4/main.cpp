@@ -252,13 +252,17 @@ struct SurfaceConstants
     XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
     XMFLOAT4X4 MatTransform = MathHelper::Identity4x4();
     float DisplacementMul = 0.0f;
-    XMFLOAT3 Pad = { 0.0f, 0.0f, 0.0f };
+    float Roughness = 0.8f;    // лаба 8 (PBR): шероховатость 0..1
+    float Metallic = 0.0f;     // лаба 8 (PBR): 0 — диэлектрик, 1 — металл
+    float Pad = 0.0f;
 };
 
 struct MaterialAnim
 {
     XMFLOAT2 Tiling = { 1.0f, 1.0f };
     XMFLOAT2 ScrollSpeed = { 0.0f, 0.0f };
+    float Roughness = 0.8f;    // PBR-параметры материала (подбираются по имени)
+    float Metallic = 0.0f;
 };
 
 // 4 текстуры на материал -> t0..t3
@@ -385,6 +389,11 @@ private:
     // ---------- Лаба 6: система частиц на GPU ----------
     static const UINT kMaxParticles = 131072;   // если тормозит — уменьшите до 32768
     ParticleSystem mParticles;
+
+    // ---------- Лаба 8: PBR + IBL ----------
+    bool  mIblOn = true;             // Q — IBL вкл/выкл
+    float mIblIntensity = 0.5f;      // 6 / 7 — сила IBL
+    UINT  mMaterialOverride = 0;     // R — 0: материалы сцены, 1: всё гладкий металл, 2: всё матовое
 };
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
@@ -444,6 +453,9 @@ bool SponzaApp::Initialize()
         mBackBufferFormat, mDepthStencilFormat, matCount * 4);
     mRendererReady = true;
 
+    // Лаба 8: заранее рассчитанные карты IBL (irradiance, pre-filtered environment, BRDF LUT)
+    mRenderer.LoadIBL(mCommandList.Get(), L"Models/ibl/");
+
     BuildMaterialSrvs();
     BuildConstantBuffers();
     BuildMaterialAnimations();
@@ -481,6 +493,7 @@ bool SponzaApp::Initialize()
         mSponzaGeo->DisposeUploaders();
     mObjects.DisposeUploaders();
     mParticles.DisposeUploaders();
+    mRenderer.DisposeUploaders();
 
     UpdateCaption();
     return true;
@@ -506,13 +519,17 @@ bool SponzaApp::KeyPressed(int vk)
 void SponzaApp::UpdateCaption()
 {
     const PostConstants& post = mRenderer.Post();
+    (void)post;
+    static const wchar_t* kOverride[] = { L"scene", L"polished metal", L"rough matte" };
+    static const wchar_t* kView[] = { L"lit", L"albedo", L"normal", L"position", L"rough/metal" };
     wchar_t buf[256];
     swprintf_s(buf,
-        L"Post[I] | Outline[Z]:%s | Fog[X]:%s | Vignette+CA[U]:%s | Particles: %u | Shadows[J]:%s",
-        post.OutlineEnabled ? L"on" : L"off",
-        post.FogEnabled ? L"on" : L"off",
-        post.VignetteEnabled ? L"on" : L"off",
-        mParticles.AliveCount(),
+        L"PBR + IBL[Q]:%s (x%.2f [6/7]) | Materials[R]: %s | View[G]: %s | Sun[L]:%s | Shadows[J]:%s | Post[I]",
+        mRenderer.IBLLoaded() ? (mIblOn ? L"on" : L"off") : L"NOT LOADED",
+        mIblIntensity,
+        kOverride[mMaterialOverride % 3],
+        kView[mRenderer.DebugView() % 5],
+        mSunOn ? L"on" : L"off",
         mShadowsOn ? L"on" : L"off");
     mMainWndCaption = buf;
 }
@@ -590,6 +607,15 @@ void SponzaApp::Update(const GameTimer& gt)
     }
     post.Time = gt.TotalTime();
 
+    // Лаба 8: PBR / IBL
+    if (KeyPressed('Q')) mIblOn = !mIblOn;
+    if (KeyPressed('R')) mMaterialOverride = (mMaterialOverride + 1) % 3;
+    if (GetAsyncKeyState('6') & 0x8000) mIblIntensity = MathHelper::Max(0.0f, mIblIntensity - dt);
+    if (GetAsyncKeyState('7') & 0x8000) mIblIntensity = MathHelper::Min(4.0f, mIblIntensity + dt);
+    mRenderer.SetIBLEnabled(mIblOn);
+    mRenderer.SetIBLIntensity(mIblIntensity);
+    mRenderer.SetMaterialOverride(mMaterialOverride);
+
     if (mAnimEnabled)
         mAnimTime += dt;
 
@@ -629,6 +655,15 @@ void SponzaApp::Update(const GameTimer& gt)
     UpdateObjectCB();
     UpdateMaterialCB();
     UpdateLights();
+
+    // Обратная ViewProj — lighting pass восстанавливает по ней направление взгляда для неба
+    {
+        XMMATRIX vp = mCamera.GetView() * mCamera.GetProj();
+        XMVECTOR det = XMMatrixDeterminant(vp);
+        XMFLOAT4X4 invVP;
+        XMStoreFloat4x4(&invVP, XMMatrixInverse(&det, vp));
+        mRenderer.SetInvViewProj(invVP);
+    }
     mRenderer.UpdatePassConstants(mCamera.GetPosition3f());
 }
 
@@ -683,6 +718,8 @@ void SponzaApp::UpdateMaterialCB()
         sc.DiffuseAlbedo = materials[i].DiffuseAlbedo;
         XMStoreFloat4x4(&sc.MatTransform, XMMatrixTranspose(S * T));
         sc.DisplacementMul = mMatTextures[i].DisplacementMul;
+        sc.Roughness = a.Roughness;
+        sc.Metallic = a.Metallic;
         mMaterialCB->CopyData((int)i, sc);
     }
 }
@@ -974,6 +1011,18 @@ void SponzaApp::BuildMaterialAnimations()
             mMatAnims[i].Tiling = { 3.0f, 3.0f };
         else if (name.find("fabric") != std::string::npos)
             mMatAnims[i].ScrollSpeed = { 0.05f, 0.0f };
+
+        // ---- Лаба 8: PBR-параметры. В OBJ/MTL их нет, поэтому подбираем по имени материала ----
+        auto has = [&](const char* s) { return name.find(s) != std::string::npos; };
+        MaterialAnim& a = mMatAnims[i];
+        if (has("chain"))                              { a.Metallic = 1.0f; a.Roughness = 0.45f; }   // цепи — железо
+        else if (has("flagpole") || has("hanging"))    { a.Metallic = 1.0f; a.Roughness = 0.30f; }   // флагштоки, подвесные вазы — металл
+        else if (has("fabric"))                        { a.Metallic = 0.0f; a.Roughness = 0.95f; }   // ткань — очень матовая
+        else if (has("floor"))                         { a.Metallic = 0.0f; a.Roughness = 0.45f; }   // отполированный камень
+        else if (has("vase"))                          { a.Metallic = 0.0f; a.Roughness = 0.35f; }   // глазурованная керамика
+        else if (has("leaf") || has("material__57"))   { a.Metallic = 0.0f; a.Roughness = 0.60f; }   // листья
+        else if (has("roof"))                          { a.Metallic = 0.0f; a.Roughness = 0.90f; }   // черепица
+        else                                           { a.Metallic = 0.0f; a.Roughness = 0.75f; }   // камень, кирпич, штукатурка
     }
 }
 

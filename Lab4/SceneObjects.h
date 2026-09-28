@@ -27,6 +27,7 @@ struct InstanceData
 {
     DirectX::XMFLOAT4X4 World;
     DirectX::XMFLOAT4 Color;
+    DirectX::XMFLOAT4 Surface = { 0.5f, 0.0f, 0.0f, 0.0f };   // лаба 8: x = roughness, y = metallic
 };
 
 // Тысячи простых объектов, раскиданных по сцене, + их отсечение по фрустуму
@@ -59,6 +60,7 @@ private:
     {
         DirectX::XMFLOAT4X4 World;
         DirectX::XMFLOAT4 Color;
+        DirectX::XMFLOAT4 Surface = { 0.5f, 0.0f, 0.0f, 0.0f };   // roughness, metallic
         UINT Mesh = MeshBox;
     };
 

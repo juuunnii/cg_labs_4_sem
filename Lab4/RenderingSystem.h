@@ -6,6 +6,7 @@
 #include "Model.h"
 #include <vector>
 #include <memory>
+#include <string>
 
 class ParticleSystem;   // лаба 6: рисуется в geometry pass
 
@@ -54,6 +55,17 @@ struct LightingPassConstants
     UINT ShowCascades = 0;       // подкрасить каскады цветом
     int  ShadowLightIndex = 0;   // какой источник отбрасывает тени
     float ShadowMapSize = 2048.0f;
+
+    // ---- Лаба 8: PBR + IBL ----
+    DirectX::XMFLOAT4X4 InvViewProj;          // экран -> мир (направление взгляда для неба)
+    float InvScreenWidth = 1.0f / 1280.0f;
+    float InvScreenHeight = 1.0f / 720.0f;
+    float PrefilteredMaxLod = 4.0f;           // последний mip pre-filtered map (= roughness 1)
+    float IBLIntensity = 0.5f;
+    UINT  IBLEnabled = 1;
+    UINT  MaterialOverride = 0;               // 0 — как в G-буфере, 1 — гладкий металл, 2 — матовый диэлектрик
+    float LightScale = 3.14159265f;           // перевод «яркости» источников в radiance (см. шейдер)
+    float Exposure = 1.0f;                    // экспозиция перед тонмаппингом (HDR -> LDR)
 
     LightData Lights[kMaxDeferredLights];
 };
@@ -149,7 +161,7 @@ public:
     void SetAmbient(const DirectX::XMFLOAT4& c)  { mPass.Ambient = c; }
     void SetSkyColor(const DirectX::XMFLOAT4& c) { mPass.SkyColor = c; }
     void SetPositionScale(float s)               { mPass.PositionScale = s; }
-    void SetDebugView(UINT v)                    { mPass.DebugView = v % 4; }
+    void SetDebugView(UINT v)                    { mPass.DebugView = v % 5; }   // 4 — roughness/metallic
     UINT DebugView() const                       { return mPass.DebugView; }
 
     void SetWireframe(bool w)                    { mWireframe = w; }
@@ -174,6 +186,18 @@ public:
     // ---- Пост-обработка ----
     PostConstants& Post() { return mPost; }
 
+    // ---- Лаба 8: IBL ----
+    // Загружает irradiance.dds, prefiltered.dds, brdf_lut.dds из папки dir.
+    // Команды копирования пишутся в cmdList — его нужно выполнить и дождаться (FlushCommandQueue),
+    // после чего вызвать DisposeUploaders().
+    bool LoadIBL(ID3D12GraphicsCommandList* cmdList, const std::wstring& dir);
+    void DisposeUploaders();
+    bool IBLLoaded() const                       { return mIblLoaded; }
+    void SetIBLEnabled(bool e)                   { mIblEnabled = e; }
+    void SetIBLIntensity(float i)                { mPass.IBLIntensity = i; }
+    void SetMaterialOverride(UINT m)             { mPass.MaterialOverride = m; }
+    void SetInvViewProj(const DirectX::XMFLOAT4X4& invViewProj);
+
     void UpdatePassConstants(const DirectX::XMFLOAT3& eyePosW);
 
     void Render(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene,
@@ -183,6 +207,7 @@ private:
     void BuildRootSignatures();
     void BuildShadersAndPSOs();
     void BuildSceneColor(UINT width, UINT height);
+    void CreateIBLSrvs();
     void RenderShadowPass(ID3D12GraphicsCommandList* cmdList, const SceneDrawData& scene);
 
 private:
@@ -195,7 +220,7 @@ private:
     GBuffer mGBuffer;
     CascadedShadowMap mShadowMap;
 
-    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap]
+    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap][IBL x3][SceneColor]
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mSrvHeap;
     UINT mSrvDescriptorSize = 0;
     UINT mNumSceneSrvs = 0;
@@ -223,7 +248,6 @@ private:
 
     // ---- Пост-обработка ----
     // Lighting pass рисует в mSceneColor, пост-проход читает её (+ G-буфер) и пишет в back buffer.
-    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap][SceneColor]
     UINT mWidth = 0;
     UINT mHeight = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> mSceneColor;
@@ -233,4 +257,14 @@ private:
     Microsoft::WRL::ComPtr<ID3DBlob> mPostVS, mPostPS;
     std::unique_ptr<UploadBuffer<PostConstants>> mPostCB;
     PostConstants mPost;
+
+    // ---- Лаба 8: IBL ----
+    // Куча: [текстуры сцены][Albedo][Normal][Position][ShadowMap][Irradiance][Prefiltered][BRDF LUT][SceneColor]
+    enum IblSlot : UINT { IblIrradiance = 0, IblPrefiltered, IblBrdfLut, IblCount };
+    Microsoft::WRL::ComPtr<ID3D12Resource> mIblTex[IblCount];
+    Microsoft::WRL::ComPtr<ID3D12Resource> mIblUpload[IblCount];
+    bool mIblLoaded = false;
+    bool mIblEnabled = true;
+    UINT IblSrvIndex(UINT slot) const { return mNumSceneSrvs + GBuffer::Count + 1 + slot; }
+    UINT SceneColorSrvIndex() const   { return mNumSceneSrvs + GBuffer::Count + 1 + IblCount; }
 };

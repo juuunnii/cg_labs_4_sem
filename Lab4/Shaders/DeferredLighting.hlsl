@@ -1,7 +1,17 @@
 //======================================================================================
-// LIGHTING PASS — полноэкранный треугольник.
-// Для каждого пикселя читаем G-буфер, суммируем вклад всех источников,
-// для солнца учитываем каскадные тени с PCF.
+// LIGHTING PASS (лаба 8) — полноэкранный треугольник, физически корректное освещение.
+//
+//  Прямой свет:  Cook-Torrance BRDF
+//                  f = kD * albedo / PI  +  D * G * F / (4 (N·V)(N·L))
+//                  D — GGX (Trowbridge-Reitz), G — Smith + Schlick-GGX, F — Schlick
+//  Фоновый свет: IBL (image based lighting), split-sum аппроксимация Карриса:
+//                  диффузный  = irradiance(N) * albedo * kD
+//                  зеркальный = prefiltered(R, roughness) * (F0 * A + B),  (A, B) = BRDF_LUT(N·V, roughness)
+//  Все три карты рассчитаны заранее (gen_ibl.py) и загружаются из .dds.
+//
+//  G-буфер: Albedo.rgb = базовый цвет, Albedo.a = roughness,
+//           Normal.xyz = нормаль,      Normal.w = metallic,
+//           Position.xyz = мировая позиция, Position.w = 1 (есть геометрия)
 //======================================================================================
 
 #define MAX_LIGHTS    32
@@ -10,6 +20,8 @@
 #define LIGHT_DIRECTIONAL 0
 #define LIGHT_POINT       1
 #define LIGHT_SPOT        2
+
+static const float PI = 3.14159265f;
 
 struct LightData
 {
@@ -24,12 +36,19 @@ struct LightData
     float2 Pad;
 };
 
-Texture2D      gAlbedoMap   : register(t0);
-Texture2D      gNormalMap   : register(t1);
-Texture2D      gPositionMap : register(t2);
-Texture2DArray gShadowMap   : register(t3);   // слой = каскад
+Texture2D      gAlbedoMap      : register(t0);
+Texture2D      gNormalMap      : register(t1);
+Texture2D      gPositionMap    : register(t2);
+Texture2DArray gShadowMap      : register(t3);   // слой = каскад
 
-SamplerComparisonState gsamShadow : register(s0);
+// ---- IBL (лаба 8) ----
+TextureCube    gIrradianceMap  : register(t4);   // свёртка окружения с косинусом — диффузный свет
+TextureCube    gPrefilteredMap : register(t5);   // окружение, размытое по GGX; mip = roughness * maxLod
+Texture2D      gBrdfLut        : register(t6);   // BRDF integration map: (N·V, roughness) -> (A, B)
+
+SamplerComparisonState gsamShadow      : register(s0);
+SamplerState           gsamLinearWrap  : register(s1);
+SamplerState           gsamLinearClamp : register(s2);
 
 // Совпадает с LightingPassConstants в RenderingSystem.h
 cbuffer cbLighting : register(b0)
@@ -52,6 +71,17 @@ cbuffer cbLighting : register(b0)
     int       gShadowLightIndex;
     float     gShadowMapSize;
 
+    // ---- PBR + IBL ----
+    float4x4  gInvViewProj;
+    float     gInvScreenWidth;
+    float     gInvScreenHeight;
+    float     gPrefilteredMaxLod;
+    float     gIBLIntensity;
+    uint      gIBLEnabled;
+    uint      gMaterialOverride;    // 0 — из G-буфера, 1 — гладкий металл, 2 — матовый диэлектрик
+    float     gLightScale;
+    float     gExposure;
+
     LightData gLights[MAX_LIGHTS];
 };
 
@@ -69,10 +99,8 @@ VertexOut VS(uint id : SV_VertexID)
 }
 
 //--------------------------------------------------------------------------------------
-// Каскадные тени
+// Каскадные тени (без изменений с лабы 5)
 //--------------------------------------------------------------------------------------
-
-// Номер каскада по глубине точки в пространстве камеры; CASCADE_COUNT — за пределами теней
 uint SelectCascade(float viewDepth)
 {
     if (viewDepth <= gCascadeSplits.x) return 0;
@@ -94,21 +122,17 @@ float ShadowFactor(float3 P, float3 N, uint cascade)
     if (gShadowsEnabled == 0 || cascade >= CASCADE_COUNT)
         return 1.0f;
 
-    // Normal offset: чуть сдвигаем точку вдоль нормали — против «теневых прыщей»
-    float3 Poffset = P + N * CascadeTexel(cascade) * 1.5f;
+    float3 Poffset = P + N * CascadeTexel(cascade) * 1.5f;   // normal offset против shadow acne
 
     float4 sp = mul(float4(Poffset, 1.0f), gShadowViewProj[cascade]);
     sp.xyz /= sp.w;
 
-    // NDC -> UV текстуры (ось Y в текстуре направлена вниз)
     float2 uv = float2(sp.x * 0.5f + 0.5f, -sp.y * 0.5f + 0.5f);
     float depth = sp.z;
 
     if (any(uv < 0.0f) || any(uv > 1.0f) || depth > 1.0f)
         return 1.0f;
 
-    // PCF: усредняем сравнения в окне k x k текселей.
-    // Каждое SampleCmp ещё и билинейно смешивает 4 соседа — края получаются мягкими.
     const float texel = 1.0f / gShadowMapSize;
     const int r = (int)gPcfKernel / 2;
 
@@ -129,7 +153,46 @@ float ShadowFactor(float3 P, float3 N, uint cascade)
 }
 
 //--------------------------------------------------------------------------------------
-// Освещение
+// Cook-Torrance: составные части
+//--------------------------------------------------------------------------------------
+
+// D — распределение микрограней GGX / Trowbridge-Reitz
+float DistributionGGX(float NdotH, float roughness)
+{
+    float a  = roughness * roughness;   // «перцептивная» шероховатость -> alpha
+    float a2 = a * a;
+    float d  = NdotH * NdotH * (a2 - 1.0f) + 1.0f;
+    return a2 / (PI * d * d);
+}
+
+// G1 — Schlick-GGX; для прямого света k = (r + 1)^2 / 8
+float GeometrySchlickGGX(float NdotX, float k)
+{
+    return NdotX / (NdotX * (1.0f - k) + k);
+}
+
+// G — Smith: затенение (для L) и маскирование (для V) микрогранями
+float GeometrySmith(float NdotV, float NdotL, float roughness)
+{
+    float r = roughness + 1.0f;
+    float k = (r * r) / 8.0f;
+    return GeometrySchlickGGX(NdotV, k) * GeometrySchlickGGX(NdotL, k);
+}
+
+// F — Френель, аппроксимация Шлика
+float3 FresnelSchlick(float cosTheta, float3 F0)
+{
+    return F0 + (1.0f - F0) * pow(saturate(1.0f - cosTheta), 5.0f);
+}
+
+// Френель для IBL: у шероховатых поверхностей «блик по краям» слабее
+float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness)
+{
+    return F0 + (max((float3)(1.0f - roughness), F0) - F0) * pow(saturate(1.0f - cosTheta), 5.0f);
+}
+
+//--------------------------------------------------------------------------------------
+// Прямой свет от одного источника (radiance * BRDF * cos)
 //--------------------------------------------------------------------------------------
 float DistanceAttenuation(float dist, float range)
 {
@@ -137,7 +200,8 @@ float DistanceAttenuation(float dist, float range)
     return x * x;
 }
 
-float3 ComputeLight(LightData light, float3 P, float3 N, float3 V, float3 albedo)
+float3 ComputeLightPBR(LightData light, float3 P, float3 N, float3 V,
+                       float3 albedo, float roughness, float metallic, float3 F0)
 {
     float3 L;
     float attenuation = 1.0f;
@@ -164,12 +228,83 @@ float3 ComputeLight(LightData light, float3 P, float3 N, float3 V, float3 albedo
     if (NdotL <= 0.0f || attenuation <= 0.0f)
         return 0;
 
-    float3 H = normalize(L + V);
-    float specular = pow(saturate(dot(N, H)), 32.0f) * 0.25f;
+    float3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 1e-4f);
+    float NdotH = saturate(dot(N, H));
+    float HdotV = saturate(dot(H, V));
 
-    return (albedo + specular) * NdotL * light.Color * light.Intensity * attenuation;
+    // Для точечных источников совсем нулевая шероховатость даёт бесконечно узкий блик
+    float r = max(roughness, 0.04f);
+
+    float  D = DistributionGGX(NdotH, r);
+    float  G = GeometrySmith(NdotV, NdotL, r);
+    float3 F = FresnelSchlick(HdotV, F0);
+
+    float3 specular = (D * G * F) / (4.0f * NdotV * NdotL + 1e-4f);
+
+    // Энергия, не отражённая зеркально, уходит в диффузию; у металлов диффузии нет
+    float3 kD = (1.0f - F) * (1.0f - metallic);
+    float3 diffuse = kD * albedo / PI;
+
+    // gLightScale = PI: «Intensity» источника в сцене задавалась так, что белая поверхность
+    // при NdotL = 1 имела яркость Intensity (как в Ламберте прошлых лаб) — сохраняем тот же вид
+    float3 radiance = light.Color * light.Intensity * gLightScale * attenuation;
+
+    return (diffuse + specular) * radiance * NdotL;
 }
 
+//--------------------------------------------------------------------------------------
+// IBL: фоновое освещение от окружения
+//--------------------------------------------------------------------------------------
+float3 ComputeIBL(float3 N, float3 V, float3 albedo, float roughness, float metallic, float3 F0)
+{
+    float NdotV = max(dot(N, V), 1e-4f);
+    float3 R = reflect(-V, N);
+
+    float3 F  = FresnelSchlickRoughness(NdotV, F0, roughness);
+    float3 kD = (1.0f - F) * (1.0f - metallic);
+
+    // 1) Диффузная часть: irradiance map уже содержит интеграл по полусфере вокруг N
+    float3 irradiance = gIrradianceMap.SampleLevel(gsamLinearWrap, N, 0.0f).rgb;
+    float3 diffuse = irradiance * albedo;
+
+    // 2) Зеркальная часть (split-sum):
+    //    первая сумма — pre-filtered environment map (mip выбирается по шероховатости),
+    //    вторая — BRDF integration map: масштаб A и смещение B для F0
+    float3 prefiltered = gPrefilteredMap.SampleLevel(gsamLinearWrap, R, roughness * gPrefilteredMaxLod).rgb;
+    float2 envBrdf = gBrdfLut.SampleLevel(gsamLinearClamp, float2(NdotV, roughness), 0.0f).rg;
+    float3 specular = prefiltered * (F * envBrdf.x + envBrdf.y);
+
+    return (kD * diffuse + specular) * gIBLIntensity;
+}
+
+//--------------------------------------------------------------------------------------
+// Тонмаппинг: HDR -> [0,1] (ACES, аппроксимация Narkowicz)
+//--------------------------------------------------------------------------------------
+float3 ToneMapACES(float3 x)
+{
+    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+float4 FinalColor(float3 hdr)
+{
+    float3 ldr = ToneMapACES(hdr * gExposure);
+    return float4(pow(ldr, 1.0f / 2.2f), 1.0f);
+}
+
+// Направление взгляда через пиксель: точка на дальней плоскости -> мир
+float3 ViewRay(float2 pixel)
+{
+    float2 uv  = (pixel + 0.5f) * float2(gInvScreenWidth, gInvScreenHeight);
+    float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    float4 p = mul(float4(ndc, 1.0f, 1.0f), gInvViewProj);
+    return normalize(p.xyz / p.w - gEyePosW);
+}
+
+//--------------------------------------------------------------------------------------
+// PIXEL SHADER
+//--------------------------------------------------------------------------------------
 float4 PS(VertexOut pin) : SV_Target
 {
     int3 coord = int3(pin.PosH.xy, 0);
@@ -181,31 +316,51 @@ float4 PS(VertexOut pin) : SV_Target
     if (gDebugView == 1) return float4(albedoSample.rgb, 1.0f);
     if (gDebugView == 2) return float4(normalSample.xyz * 0.5f + 0.5f, 1.0f);
     if (gDebugView == 3) return float4(frac(positionSample.xyz * gPositionScale), 1.0f);
+    if (gDebugView == 4) return float4(albedoSample.a, normalSample.w, 0.0f, 1.0f);   // R = roughness, G = metallic
 
+    // ---- Небо: то же окружение, из которого рассчитан IBL ----
     if (positionSample.w == 0.0f)
+    {
+        if (gIBLEnabled != 0)
+            return FinalColor(gPrefilteredMap.SampleLevel(gsamLinearWrap, ViewRay(pin.PosH.xy), 0.0f).rgb);
         return gSkyColor;
+    }
 
-    float3 albedo = pow(abs(albedoSample.rgb), 2.2f);
+    float3 albedo    = pow(abs(albedoSample.rgb), 2.2f);   // sRGB -> линейное пространство
+    float  roughness = saturate(albedoSample.a);
+    float  metallic  = saturate(normalSample.w);
+
+    // Демонстрация: все поверхности — один материал
+    if (gMaterialOverride == 1)      { roughness = 0.15f; metallic = 1.0f; }
+    else if (gMaterialOverride == 2) { roughness = 1.0f;  metallic = 0.0f; }
+
     float3 P = positionSample.xyz;
     float3 N = normalize(normalSample.xyz);
     float3 V = normalize(gEyePosW - P);
 
-    // Глубина точки в пространстве камеры — по ней выбирается каскад
+    // Отражательная способность при нормальном падении: 4% у диэлектриков, цвет — у металлов
+    float3 F0 = lerp((float3)0.04f, albedo, metallic);
+
     float viewDepth = dot(P - gEyePosW, gCameraForward);
     uint cascade = SelectCascade(viewDepth);
 
-    float3 color = gAmbient.rgb * albedo;
-
+    // ---- Прямой свет ----
+    float3 color = 0.0f;
     [loop]
     for (uint i = 0; i < gNumLights; ++i)
     {
-        float3 contribution = ComputeLight(gLights[i], P, N, V, albedo);
+        float3 contribution = ComputeLightPBR(gLights[i], P, N, V, albedo, roughness, metallic, F0);
         if ((int)i == gShadowLightIndex)
             contribution *= ShadowFactor(P, N, cascade);
         color += contribution;
     }
 
-    // Отладка: подкрасить каскады (красный, зелёный, синий, жёлтый)
+    // ---- Фоновый свет: IBL или (если выключен) постоянный ambient ----
+    if (gIBLEnabled != 0)
+        color += ComputeIBL(N, V, albedo, roughness, metallic, F0);
+    else
+        color += gAmbient.rgb * albedo;
+
     if (gShowCascades != 0 && cascade < CASCADE_COUNT)
     {
         static const float3 tints[CASCADE_COUNT] =
@@ -216,6 +371,5 @@ float4 PS(VertexOut pin) : SV_Target
         color *= tints[cascade];
     }
 
-    color = saturate(color);
-    return float4(pow(color, 1.0f / 2.2f), 1.0f);
+    return FinalColor(color);
 }

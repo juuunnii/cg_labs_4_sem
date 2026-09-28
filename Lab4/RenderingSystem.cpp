@@ -31,10 +31,10 @@ void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
     mNumSceneSrvs = numSceneSrvs;
     mSrvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    // Куча: [текстуры сцены ...][Albedo][Normal][Position][ShadowMap][SceneColor]
-    // G-буфер, карта теней и цвет сцены лежат подряд — удобно брать одной таблицей
+    // Куча: [текстуры сцены ...][Albedo][Normal][Position][ShadowMap][Irradiance][Prefiltered][BRDF LUT][SceneColor]
+    // G-буфер, карта теней, карты IBL и цвет сцены лежат подряд — удобно брать одной таблицей
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = numSceneSrvs + GBuffer::Count + 2;
+    heapDesc.NumDescriptors = numSceneSrvs + GBuffer::Count + 1 + IblCount + 1;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mSrvHeap)));
@@ -47,6 +47,10 @@ void RenderingSystem::Initialize(ID3D12Device* device, UINT width, UINT height,
         (INT)(numSceneSrvs + GBuffer::Count), mSrvDescriptorSize);
     mShadowMap.Initialize(device, kShadowMapSize, shadowSrv);
     mPass.ShadowMapSize = (float)kShadowMapSize;
+    XMStoreFloat4x4(&mPass.InvViewProj, XMMatrixIdentity());
+
+    // Пока карты IBL не загружены — «пустые» SRV (чтение из них возвращает 0), чтобы таблица была валидной
+    CreateIBLSrvs();
 
     mPassCB = std::make_unique<UploadBuffer<LightingPassConstants>>(device, 1, true);
     mPostCB = std::make_unique<UploadBuffer<PostConstants>>(device, 1, true);
@@ -72,6 +76,8 @@ void RenderingSystem::BuildSceneColor(UINT width, UINT height)
     mHeight = height;
     mPost.InvWidth = 1.0f / (float)width;
     mPost.InvHeight = 1.0f / (float)height;
+    mPass.InvScreenWidth = mPost.InvWidth;
+    mPass.InvScreenHeight = mPost.InvHeight;
 
     mSceneColor.Reset();
 
@@ -92,7 +98,7 @@ void RenderingSystem::BuildSceneColor(UINT width, UINT height)
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Texture2D.MipLevels = 1;
     CD3DX12_CPU_DESCRIPTOR_HANDLE h(mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
-        (INT)(mNumSceneSrvs + GBuffer::Count + 1), mSrvDescriptorSize);
+        (INT)SceneColorSrvIndex(), mSrvDescriptorSize);
     mDevice->CreateShaderResourceView(mSceneColor.Get(), &srv, h);
 }
 
@@ -127,9 +133,95 @@ void RenderingSystem::UpdateShadows(const XMFLOAT4X4& cameraView, const XMFLOAT3
     mPass.CameraForward = cameraForward;
 }
 
+//======================================================================================
+// Лаба 8: загрузка заранее рассчитанных карт IBL
+//======================================================================================
+void RenderingSystem::CreateIBLSrvs()
+{
+    for (UINT slot = 0; slot < IblCount; ++slot)
+    {
+        // Пока карты не загружены полностью — null-дескрипторы (чтение возвращает 0)
+        ID3D12Resource* res = mIblLoaded ? mIblTex[slot].Get() : nullptr;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (slot == IblBrdfLut)
+        {
+            srv.Format = res ? res->GetDesc().Format : DXGI_FORMAT_R16G16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = res ? res->GetDesc().MipLevels : 1;
+        }
+        else
+        {
+            // DDS-куб загружается как Texture2D с 6 слоями — смотрим на него через TEXTURECUBE
+            srv.Format = res ? res->GetDesc().Format : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MipLevels = res ? res->GetDesc().MipLevels : 1;
+        }
+
+        CD3DX12_CPU_DESCRIPTOR_HANDLE h(mSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+            (INT)IblSrvIndex(slot), mSrvDescriptorSize);
+        mDevice->CreateShaderResourceView(res, &srv, h);   // res == nullptr -> null-дескриптор
+    }
+}
+
+bool RenderingSystem::LoadIBL(ID3D12GraphicsCommandList* cmdList, const std::wstring& dir)
+{
+    static const wchar_t* kFiles[IblCount] = { L"irradiance.dds", L"prefiltered.dds", L"brdf_lut.dds" };
+
+    mIblLoaded = false;
+    std::wstring missing;
+    for (UINT slot = 0; slot < IblCount; ++slot)
+    {
+        const std::wstring path = dir + kFiles[slot];
+        HRESULT hr = DirectX::CreateDDSTextureFromFile12(mDevice, cmdList, path.c_str(),
+            mIblTex[slot], mIblUpload[slot]);
+        if (FAILED(hr))
+            missing += L"  " + path + L"\n";
+        else
+        {
+            OutputDebugStringW((L"[IBL] loaded " + path + L"\n").c_str());
+        }
+    }
+
+    // Проверка: irradiance и prefiltered должны быть кубами (6 слоёв)
+    for (UINT slot : { (UINT)IblIrradiance, (UINT)IblPrefiltered })
+    {
+        if (mIblTex[slot] && mIblTex[slot]->GetDesc().DepthOrArraySize != 6)
+            missing += L"  " + dir + kFiles[slot] + L" (not a cube map)\n";
+    }
+
+    // Уже загруженные текстуры не освобождаем: их копирование записано в cmdList и ещё не выполнено
+    if (!missing.empty())
+    {
+        CreateIBLSrvs();   // mIblLoaded == false -> null-дескрипторы
+        std::wstring msg = L"Failed to load IBL maps:\n" + missing +
+            L"\nPut irradiance.dds, prefiltered.dds, brdf_lut.dds into Models/ibl/\nIBL will be disabled.";
+        MessageBoxW(nullptr, msg.c_str(), L"IBL", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    mPass.PrefilteredMaxLod = (float)(mIblTex[IblPrefiltered]->GetDesc().MipLevels - 1);
+    mIblLoaded = true;
+    CreateIBLSrvs();
+    return true;
+}
+
+void RenderingSystem::DisposeUploaders()
+{
+    for (auto& u : mIblUpload)
+        u.Reset();
+}
+
+void RenderingSystem::SetInvViewProj(const XMFLOAT4X4& invViewProj)
+{
+    XMStoreFloat4x4(&mPass.InvViewProj, XMMatrixTranspose(XMLoadFloat4x4(&invViewProj)));
+}
+
 void RenderingSystem::UpdatePassConstants(const XMFLOAT3& eyePosW)
 {
     mPass.EyePosW = eyePosW;
+    mPass.IBLEnabled = (mIblEnabled && mIblLoaded) ? 1u : 0u;
     mPass.NumLights = (UINT)(std::min)(mLights.size(), (size_t)kMaxDeferredLights);
     for (UINT i = 0; i < mPass.NumLights; ++i)
         mPass.Lights[i] = mLights[i];
@@ -179,10 +271,11 @@ void RenderingSystem::BuildRootSignatures()
         mInstancedRootSig = CreateRootSignature(mDevice, desc);
     }
 
-    // ---------- Lighting pass: t0..t2 G-буфер, t3 карта теней, b0 свет; s0 — сэмплер сравнения ----------
+    // ---------- Lighting pass: t0..t2 G-буфер, t3 карта теней, t4..t6 IBL, b0 свет ----------
+    //            s0 — сэмплер сравнения (тени), s1 — линейный (кубы IBL), s2 — линейный clamp (BRDF LUT)
     {
         CD3DX12_DESCRIPTOR_RANGE table;
-        table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::Count + 1, 0);
+        table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::Count + 1 + IblCount, 0);
 
         CD3DX12_ROOT_PARAMETER params[2];
         params[0].InitAsDescriptorTable(1, &table, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -195,15 +288,26 @@ void RenderingSystem::BuildRootSignatures()
             D3D12_TEXTURE_ADDRESS_MODE_BORDER, 0.0f, 16,
             D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE);
 
-        CD3DX12_ROOT_SIGNATURE_DESC desc(2, params, 1, &shadowSampler,
+        CD3DX12_STATIC_SAMPLER_DESC samplers[3] =
+        {
+            shadowSampler,
+            CD3DX12_STATIC_SAMPLER_DESC(1, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                D3D12_TEXTURE_ADDRESS_MODE_WRAP),
+            CD3DX12_STATIC_SAMPLER_DESC(2, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                D3D12_TEXTURE_ADDRESS_MODE_CLAMP)
+        };
+
+        CD3DX12_ROOT_SIGNATURE_DESC desc(2, params, 3, samplers,
             D3D12_ROOT_SIGNATURE_FLAG_NONE);
         mLightingRootSig = CreateRootSignature(mDevice, desc);
     }
 
-    // ---------- Пост-обработка: t0..t2 G-буфер, (t3 тени — не нужны), t4 цвет сцены; b0 параметры ----------
+    // ---------- Пост-обработка: t0..t2 G-буфер, (t3 тени, t4..t6 IBL — не нужны), t7 цвет сцены ----------
     {
         CD3DX12_DESCRIPTOR_RANGE table;
-        table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::Count + 2, 0);
+        table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBuffer::Count + 1 + IblCount + 1, 0);
 
         CD3DX12_ROOT_PARAMETER params[2];
         params[0].InitAsDescriptorTable(1, &table, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -485,7 +589,7 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
     mGBuffer.EndGeometryPass(cmdList);
 
     //==================================================================
-    // 2. LIGHTING PASS — свет + каскадные тени -> текстура «цвет сцены»
+    // 2. LIGHTING PASS — PBR (Cook-Torrance) + каскадные тени + IBL -> текстура «цвет сцены»
     //==================================================================
     CD3DX12_RESOURCE_BARRIER toRT = CD3DX12_RESOURCE_BARRIER::Transition(mSceneColor.Get(),
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -499,7 +603,7 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
 
     CD3DX12_GPU_DESCRIPTOR_HANDLE gbufferSrv(mSrvHeap->GetGPUDescriptorHandleForHeapStart(),
         (INT)mNumSceneSrvs, mSrvDescriptorSize);
-    cmdList->SetGraphicsRootDescriptorTable(0, gbufferSrv);   // t0..t2 G-буфер, t3 карта теней
+    cmdList->SetGraphicsRootDescriptorTable(0, gbufferSrv);   // t0..t2 G-буфер, t3 тени, t4..t6 IBL
     cmdList->SetGraphicsRootConstantBufferView(1, mPassCB->Resource()->GetGPUVirtualAddress());
 
     cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -516,7 +620,7 @@ void RenderingSystem::Render(ID3D12GraphicsCommandList* cmdList, const SceneDraw
 
     cmdList->SetPipelineState(mPostPSO.Get());
     cmdList->SetGraphicsRootSignature(mPostRootSig.Get());
-    cmdList->SetGraphicsRootDescriptorTable(0, gbufferSrv);   // t0..t2 G-буфер, t4 цвет сцены
+    cmdList->SetGraphicsRootDescriptorTable(0, gbufferSrv);   // t0..t2 G-буфер, t7 цвет сцены
     cmdList->SetGraphicsRootConstantBufferView(1, mPostCB->Resource()->GetGPUVirtualAddress());
 
     // 4 вершины triangle strip = прямоугольник на весь экран; координаты строит VS по SV_VertexID

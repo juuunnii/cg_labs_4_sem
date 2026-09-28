@@ -226,7 +226,8 @@ GBufferOutput PSParticle(GSOut pin)
     float3 N = normalize(gCameraRight * pin.Corner.x + gCameraUp * pin.Corner.y + toEye * z);
 
     GBufferOutput o;
-    o.Albedo   = float4(pin.Color.rgb, 1.0f);
+    // Лаба 8: капли — гладкий диэлектрик (roughness 0.25, metallic 0)
+    o.Albedo   = float4(pin.Color.rgb, 0.25f);
     o.Normal   = float4(N, 0.0f);
     o.Position = float4(pin.CenterW + N * pin.Size, 1.0f);
     return o;
